@@ -4,6 +4,8 @@ use codex_plus_core::watcher::{
     process_ids_still_running, should_recover_stale_launcher, watcher_disabled_flag,
 };
 
+#[cfg(target_os = "linux")]
+use codex_plus_core::watcher::find_linux_codex_processes_from_proc;
 #[cfg(windows)]
 use codex_plus_core::watcher::{
     WindowsProcessInfo, find_codex_processes_from_snapshot,
@@ -70,6 +72,35 @@ fn spawn_launcher_command_points_to_silent_binary_only() {
     assert!(command.contains(&"--debug-port".to_string()));
     assert!(command.contains(&"9444".to_string()));
     assert!(!command.iter().any(|part| part.contains("manager")));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_process_scan_matches_only_the_codex_electron_main_process() {
+    let proc_root = tempfile::tempdir().unwrap();
+    for process_id in [120, 121, 122] {
+        std::fs::create_dir_all(proc_root.path().join(process_id.to_string())).unwrap();
+    }
+    std::fs::write(
+        proc_root.path().join("120/cmdline"),
+        b"/usr/lib/electron42/electron\0--enable-sandbox\0/usr/lib/openai-codex-desktop/resources/app.asar\0",
+    )
+    .unwrap();
+    std::fs::write(
+        proc_root.path().join("121/cmdline"),
+        b"/usr/lib/electron42/electron\0--type=renderer\0--app-path=/usr/lib/openai-codex-desktop/resources/app.asar\0",
+    )
+    .unwrap();
+    std::fs::write(
+        proc_root.path().join("122/cmdline"),
+        b"/usr/lib/electron/electron\0/opt/another-app/resources/app.asar\0",
+    )
+    .unwrap();
+
+    assert_eq!(
+        find_linux_codex_processes_from_proc(proc_root.path()),
+        vec![120]
+    );
 }
 
 #[test]

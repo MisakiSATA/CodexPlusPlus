@@ -104,6 +104,7 @@ import {
 import { getLanguage, t, tf, toggleLanguage } from "@/i18n";
 
 const isWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent);
+const isLinuxPlatform = /\bLinux\b/i.test(navigator.userAgent);
 const dreamSkinWindowsPreviewUrl = new URL("../../../assets/inject/upstream/dream-skin/windows/dream-reference.jpg", import.meta.url).href;
 const dreamSkinMacPreviewUrl = new URL("../../../assets/inject/upstream/dream-skin/macos/portal-hero.png", import.meta.url).href;
 
@@ -2464,8 +2465,12 @@ export function App() {
               : {
                   directory: false,
                   multiple: false,
-                  title: t("选择 Codex.exe 或 Codex.app"),
-                  filters: [{ name: t("Codex 应用"), extensions: ["exe", "app"] }],
+                  title: isLinuxPlatform
+                    ? t("选择 Codex 可执行文件")
+                    : t("选择 Codex.exe 或 Codex.app"),
+                  ...(isLinuxPlatform
+                    ? {}
+                    : { filters: [{ name: t("Codex 应用"), extensions: ["exe", "app"] }] }),
                 },
           );
         } catch (error) {
@@ -4681,7 +4686,14 @@ function MaintenanceScreen({
         </CardContent>
       </Panel>
       <Panel>
-        <CardHead title={t("入口管理")} detail={t("快捷方式写入系统实际桌面位置，不使用写死桌面路径")} />
+        <CardHead
+          title={t("入口管理")}
+          detail={
+            isLinuxPlatform
+              ? t("入口写入当前用户的应用菜单")
+              : t("快捷方式写入系统实际桌面位置，不使用写死桌面路径")
+          }
+        />
         <CardContent>
           <label className="check-row">
             <input checked={removeOwnedData} onChange={(event) => onRemoveOwnedDataChange(event.currentTarget.checked)} type="checkbox" />
@@ -4715,13 +4727,19 @@ function MaintenanceScreen({
           <Field label={t("保存的应用路径")}>
             <Input
               value={settings?.settings.codexAppPath ?? ""}
-              placeholder={t("选择 Codex.exe、Codex.app、app 目录或解包目录")}
+              placeholder={
+                isLinuxPlatform
+                  ? t("选择 Codex 可执行文件、app 目录或解包目录")
+                  : t("选择 Codex.exe、Codex.app、app 目录或解包目录")
+              }
               readOnly
             />
           </Field>
           <Toolbar>
             <Button onClick={() => void actions.chooseCodexAppPath("folder")}>{t("选择应用目录")}</Button>
-            <Button variant="secondary" onClick={() => void actions.chooseCodexAppPath("file")}>{t("选择 Codex.exe")}</Button>
+            <Button variant="secondary" onClick={() => void actions.chooseCodexAppPath("file")}>
+              {isLinuxPlatform ? t("选择 Codex 可执行文件") : t("选择 Codex.exe")}
+            </Button>
             <Button variant="secondary" onClick={() => void actions.clearCodexAppPath()}>{t("清除保存路径")}</Button>
           </Toolbar>
         </CardContent>
@@ -4733,7 +4751,12 @@ function MaintenanceScreen({
             <Input
               value={launchForm.appPath}
               onChange={(event) => onLaunchFormChange({ ...launchForm, appPath: event.currentTarget.value })}
-              placeholder={savedCodexAppPath || t("例如 C:\\Program Files\\WindowsApps\\OpenAI.Codex...\\app")}
+              placeholder={
+                savedCodexAppPath ||
+                (isLinuxPlatform
+                  ? "/usr/lib/codex-plus-plus/app"
+                  : t("例如 C:\\Program Files\\WindowsApps\\OpenAI.Codex...\\app"))
+              }
             />
           </Field>
           <div className="form-row">

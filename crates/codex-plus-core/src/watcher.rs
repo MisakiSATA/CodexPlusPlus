@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -166,9 +166,26 @@ pub fn install_watcher(launcher_path: &Path, debug_port: u16) -> anyhow::Result<
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn install_watcher(launcher_path: &Path, debug_port: u16) -> anyhow::Result<()> {
+    let Some(config_home) = crate::install::linux::default_autostart_config_home() else {
+        anyhow::bail!("无法解析当前用户的配置目录");
+    };
+    let entry_path = crate::install::linux::watcher_autostart_path(&config_home);
+    if let Some(parent) = entry_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &entry_path,
+        crate::install::linux::build_watcher_autostart_entry(launcher_path, debug_port),
+    )?;
+    spawn_launcher(launcher_path, debug_port);
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn install_watcher(_launcher_path: &Path, _debug_port: u16) -> anyhow::Result<()> {
-    anyhow::bail!("watcher install is only supported on Windows")
+    anyhow::bail!("watcher install is only supported on Windows and Linux")
 }
 
 #[cfg(windows)]
@@ -182,7 +199,18 @@ pub fn uninstall_watcher() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn uninstall_watcher() -> anyhow::Result<()> {
+    if let Some(config_home) = crate::install::linux::default_autostart_config_home() {
+        let entry_path = crate::install::linux::watcher_autostart_path(&config_home);
+        if entry_path.exists() {
+            let _ = std::fs::remove_file(&entry_path);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn uninstall_watcher() -> anyhow::Result<()> {
     Ok(())
 }
@@ -285,12 +313,53 @@ pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
     find_codex_processes()
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn find_codex_processes() -> Vec<u32> {
+    find_linux_codex_processes_from_proc(Path::new("/proc"))
+}
+
+#[cfg(target_os = "linux")]
+pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
+    find_codex_processes()
+}
+
+#[cfg(target_os = "linux")]
+pub fn find_linux_codex_processes_from_proc(proc_root: &Path) -> Vec<u32> {
+    let mut ids = std::fs::read_dir(proc_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let process_id = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let command_line = std::fs::read(entry.path().join("cmdline")).ok()?;
+            linux_codex_main_process_command(&command_line).then_some(process_id)
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+#[cfg(target_os = "linux")]
+fn linux_codex_main_process_command(command_line: &[u8]) -> bool {
+    command_line
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .filter_map(|argument| std::str::from_utf8(argument).ok())
+        .any(|argument| {
+            !argument.starts_with("--")
+                && argument.ends_with("/resources/app.asar")
+                && argument.contains("/openai-codex-desktop/")
+        })
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn find_codex_processes() -> Vec<u32> {
     Vec::new()
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
     Vec::new()
 }
@@ -346,7 +415,12 @@ pub fn stop_codex_processes() {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn stop_codex_processes() {
+    terminate_linux_processes(&find_codex_processes());
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn stop_codex_processes() {}
 
 #[cfg(windows)]
@@ -358,7 +432,16 @@ pub fn stop_codex_processes_and_wait() {
     );
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn stop_codex_processes_and_wait() {
+    terminate_and_wait_for_exit(
+        find_codex_processes(),
+        RESTART_STOP_WAIT_TIMEOUT_MS,
+        RESTART_STOP_WAIT_INTERVAL_MS,
+    );
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn stop_codex_processes_and_wait() {}
 
 #[cfg(windows)]
@@ -391,6 +474,49 @@ fn terminate_and_wait_for_exit(process_ids: Vec<u32>, timeout_ms: u64, interval_
     }
 }
 
+#[cfg(target_os = "linux")]
+fn terminate_and_wait_for_exit(process_ids: Vec<u32>, timeout_ms: u64, interval_ms: u64) {
+    if process_ids.is_empty() {
+        return;
+    }
+    terminate_linux_processes(&process_ids);
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let remaining = process_ids
+            .iter()
+            .copied()
+            .filter(|process_id| Path::new("/proc").join(process_id.to_string()).exists())
+            .collect::<Vec<_>>();
+        if remaining.is_empty() || std::time::Instant::now() >= deadline {
+            if !remaining.is_empty() {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "watcher.stop_wait_timeout",
+                    serde_json::json!({
+                        "remaining_process_ids": remaining,
+                        "timeout_ms": timeout_ms
+                    }),
+                );
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_processes(process_ids: &[u32]) {
+    if process_ids.is_empty() {
+        return;
+    }
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .args(process_ids.iter().map(u32::to_string))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 #[cfg(windows)]
 fn create_startup_shortcut(launcher_path: &Path, arguments: &str) -> anyhow::Result<()> {
     let Some(shortcut_path) = startup_shortcut_path() else {
@@ -407,7 +533,7 @@ fn create_startup_shortcut(launcher_path: &Path, arguments: &str) -> anyhow::Res
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn spawn_launcher(launcher_path: &Path, debug_port: u16) {
     let command = build_spawn_launcher_command(&launcher_path.to_string_lossy(), debug_port);
     if let Some((exe, args)) = command.split_first() {
@@ -417,8 +543,11 @@ fn spawn_launcher(launcher_path: &Path, debug_port: u16) {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+        }
         let _ = command.spawn();
     }
 }

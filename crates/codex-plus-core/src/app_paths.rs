@@ -14,6 +14,8 @@ struct AppPackageSpec {
 
 const CODEX_PACKAGE_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe", "codex.exe"];
 const STANDALONE_CODEX_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe", "codex.exe"];
+#[cfg(target_os = "linux")]
+const LINUX_CODEX_EXECUTABLES: &[&str] = &["ChatGPT", "Codex", "codex"];
 
 #[cfg(windows)]
 const OPENAI_PACKAGE_FAMILY_NAMES: &[&str] = &[
@@ -275,15 +277,42 @@ pub fn find_macos_codex_app_default() -> Option<PathBuf> {
     find_macos_codex_app(&roots)
 }
 
+#[cfg(target_os = "linux")]
+pub fn find_linux_codex_app(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find_map(|candidate| normalize_codex_app_path(candidate))
+}
+
+#[cfg(target_os = "linux")]
+pub fn find_linux_codex_app_default() -> Option<PathBuf> {
+    find_linux_codex_app(&[PathBuf::from("/usr/lib/codex-plus-plus/app")])
+}
+
 pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
     if let Some(app_dir) = app_dir {
         return normalize_codex_app_path(app_dir);
     }
-    if cfg!(target_os = "macos") {
-        return find_macos_codex_app_default();
+    #[cfg(target_os = "macos")]
+    {
+        find_macos_codex_app_default()
     }
-    // Windows: try MS Store version first, then standalone install
-    find_latest_codex_app_dir_default().or_else(|| find_standalone_codex_app_dir())
+
+    #[cfg(target_os = "linux")]
+    {
+        find_linux_codex_app_default()
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows: try MS Store version first, then standalone install.
+        find_latest_codex_app_dir_default().or_else(|| find_standalone_codex_app_dir())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }
 
 /// Search for standalone Codex installations (non-MS Store).
@@ -343,8 +372,12 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
     }
 
     // 拒绝把 Codex++ 管理工具安装目录误当成 Codex 桌面应用
-    if is_codex_plus_plus_path(path) {
+    let linux_wrapper = linux_codex_app_wrapper_dir(path);
+    if is_codex_plus_plus_path(path) && linux_wrapper.is_none() {
         return None;
+    }
+    if linux_wrapper.is_some() {
+        return linux_wrapper;
     }
 
     let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
@@ -382,6 +415,37 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
         return Some(path.to_path_buf());
     }
 
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_codex_app_wrapper_dir(path: &Path) -> Option<PathBuf> {
+    let app_dir = if path.file_name() == Some(OsStr::new("codex-plus-plus")) {
+        path.join("app")
+    } else if path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            ["ChatGPT", "Codex", "codex"]
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        })
+    {
+        path.parent().unwrap_or(path).to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    (app_dir.file_name() == Some(OsStr::new("app"))
+        && app_dir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == OsStr::new("codex-plus-plus"))
+        && linux_executable_in_dir(&app_dir).is_some())
+    .then_some(app_dir)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_codex_app_wrapper_dir(_path: &Path) -> Option<PathBuf> {
     None
 }
 
@@ -425,6 +489,10 @@ pub fn build_codex_executable(app_dir: &Path) -> PathBuf {
             return macos_dir.join(executable);
         }
         return macos_dir.join("Codex");
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(executable) = linux_executable_in_dir(app_dir) {
+        return executable;
     }
     if let Some(executable) = executable_in_dir(app_dir) {
         return executable;
@@ -650,6 +718,14 @@ fn executable_in_dir(dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_executable_in_dir(dir: &Path) -> Option<PathBuf> {
+    LINUX_CODEX_EXECUTABLES
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|candidate| candidate.exists())
 }
 
 fn codex_package_parts(package_name: &str) -> Option<(AppPackageSpec, &str, &str)> {

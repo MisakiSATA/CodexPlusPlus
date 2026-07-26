@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "linux")]
+use codex_plus_core::app_paths::find_linux_codex_app;
 use codex_plus_core::app_paths::{
     build_codex_executable, codex_app_version, find_latest_codex_app_dir,
     find_latest_codex_app_dir_from_roots, find_macos_codex_app, normalize_codex_app_path,
@@ -339,6 +341,42 @@ fn app_paths_normalizes_executable_and_package_paths() {
         normalize_codex_app_path(&portable).as_deref(),
         Some(app.as_path())
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn app_paths_normalizes_linux_aur_wrapper_executable() {
+    let temp = tempfile::tempdir().unwrap();
+    let portable = temp.path().join("codex-plus-plus");
+    let app = portable.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("codex"), "").unwrap();
+
+    assert_eq!(
+        normalize_codex_app_path(&app.join("codex")).as_deref(),
+        Some(app.as_path())
+    );
+    assert_eq!(
+        normalize_codex_app_path(&portable).as_deref(),
+        Some(app.as_path())
+    );
+    assert_eq!(
+        find_linux_codex_app(&[portable]).as_deref(),
+        Some(app.as_path())
+    );
+    assert_eq!(build_codex_executable(&app), app.join("codex"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn app_paths_does_not_treat_the_linux_codex_cli_as_desktop() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("codex"), "").unwrap();
+
+    assert_eq!(normalize_codex_app_path(&bin.join("codex")), None);
+    assert_eq!(normalize_codex_app_path(&bin), None);
 }
 
 #[test]
@@ -764,7 +802,7 @@ fn launcher_macos_open_command_adds_native_menu_inspector_argument() {
 }
 
 #[test]
-fn ports_windows_falls_back_to_ephemeral_when_requested_is_busy() {
+fn ports_falls_back_to_ephemeral_when_requested_is_busy() {
     let selected = select_platform_loopback_port_with(9229, true, |_| false, || 43001);
 
     assert_eq!(selected, 43001);
@@ -778,7 +816,7 @@ fn ports_windows_packaged_debug_falls_back_to_ephemeral_when_requested_is_busy()
 }
 
 #[test]
-fn ports_non_windows_keeps_requested_even_when_busy() {
+fn ports_keeps_requested_when_fallback_disabled() {
     let selected = select_platform_loopback_port_with(9229, false, |_| false, || 43001);
 
     assert_eq!(selected, 9229);

@@ -271,6 +271,7 @@ export const EN_PLAIN: Record<string, string> = {
   "入口安装": "Entrypoint install",
   "入口安装、修复、Watcher 与手动启动": "Entrypoint install, repair, watcher and manual launch",
   "入口管理": "Entrypoint management",
+  "入口写入当前用户的应用菜单": "Entrypoints are installed in the current user's application menu",
   "全选当前列表": "Select all in current list",
   "关于": "About",
   "关于 Codex++": "About Codex++",
@@ -754,6 +755,8 @@ export const EN_PLAIN: Record<string, string> = {
   "适合纯 API；启用插件市场、会话删除导出、项目移动等全部页面能力。":
     "Suited to pure API; enables all page capabilities including plugin marketplace, session deletion/export and project move.",
   "选择 Codex 应用目录": "Select Codex app directory",
+  "选择 Codex 可执行文件": "Select Codex executable",
+  "选择 Codex 可执行文件、app 目录或解包目录": "Select the Codex executable, app directory, or unpacked directory",
   "选择 Codex.exe": "Select Codex.exe",
   "选择 Codex.exe 或 Codex.app": "Select Codex.exe or Codex.app",
   "选择 Codex.exe、Codex.app、app 目录或解包目录": "Select Codex.exe, Codex.app, the app directory or the unpacked directory",

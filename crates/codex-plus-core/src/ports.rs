@@ -66,7 +66,7 @@ pub fn manager_guard_port() -> u16 {
 pub fn select_platform_loopback_port(requested: u16) -> u16 {
     select_platform_loopback_port_with(
         requested,
-        cfg!(windows),
+        true,
         can_bind_loopback_port,
         find_available_loopback_port,
     )
@@ -92,14 +92,14 @@ pub fn select_packaged_codex_debug_port_with(
 
 pub fn select_platform_loopback_port_with(
     requested: u16,
-    is_windows: bool,
+    should_fallback_when_busy: bool,
     can_bind: impl Fn(u16) -> bool,
     find_available: impl Fn() -> u16,
 ) -> u16 {
-    if !is_windows || can_bind(requested) {
-        requested
-    } else {
+    if should_fallback_when_busy && !can_bind(requested) {
         find_available()
+    } else {
+        requested
     }
 }
 

@@ -4,6 +4,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+pub mod linux;
 pub mod macos;
 pub mod windows;
 
@@ -83,6 +84,10 @@ pub fn app_bundle_names() -> (&'static str, &'static str) {
     ("Codex++.app", "Codex++ 管理工具.app")
 }
 
+pub fn desktop_entry_names() -> (&'static str, &'static str) {
+    (linux::SILENT_DESKTOP_FILE, linux::MANAGER_DESKTOP_FILE)
+}
+
 pub fn inspect_entrypoints() -> EntryPointState {
     let root = default_install_root();
     EntryPointState {
@@ -115,6 +120,10 @@ pub fn build_windows_entrypoint_plan(options: &InstallOptions) -> windows::Windo
 
 pub fn build_macos_app_bundle(options: &InstallOptions, manager: bool) -> MacosAppBundle {
     macos::build_app_bundle(options, manager)
+}
+
+pub fn build_linux_entrypoint_plan(options: &InstallOptions) -> linux::LinuxEntrypointPlan {
+    linux::build_entrypoint_plan(options)
 }
 
 pub fn remove_owned_data() -> std::io::Result<()> {
@@ -151,7 +160,12 @@ pub fn default_install_root() -> Option<PathBuf> {
         return Some(sys_apps);
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().join("applications"))
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         directories::UserDirs::new().and_then(|dirs| dirs.desktop_dir().map(PathBuf::from))
     }
@@ -162,6 +176,8 @@ pub fn default_install_root_strategy() -> &'static str {
         "windows-known-folder"
     } else if cfg!(target_os = "macos") {
         "macos-applications"
+    } else if cfg!(target_os = "linux") {
+        "linux-xdg-applications"
     } else {
         "user-dirs-desktop"
     }
@@ -178,11 +194,36 @@ fn platform_install(options: &InstallOptions) -> anyhow::Result<()> {
         macos::install_app_bundles(options)
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        install_linux_user_scoped(options)
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = options;
         anyhow::bail!("当前平台暂不支持安装 Codex++ 入口")
     }
+}
+
+/// Linux 完整安装闭环：复制进版本目录、切换 `current` 链接、
+/// 写入稳定入口与图标，最后尽力刷新桌面缓存。
+#[cfg(target_os = "linux")]
+fn install_linux_user_scoped(options: &InstallOptions) -> anyhow::Result<()> {
+    let Some(roots) = linux::default_install_roots() else {
+        anyhow::bail!("无法解析当前用户的 XDG 目录");
+    };
+    let installed = linux::install_user_scoped(options, &roots, crate::version::VERSION)?;
+    let warnings = linux::refresh_desktop_integration(&roots);
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "install.linux_user_scoped",
+        serde_json::json!({
+            "versionDir": installed.version_dir.to_string_lossy(),
+            "currentLink": installed.current_link.to_string_lossy(),
+            "cacheWarnings": warnings,
+        }),
+    );
+    Ok(())
 }
 
 fn platform_uninstall(options: &InstallOptions) -> anyhow::Result<()> {
@@ -196,7 +237,27 @@ fn platform_uninstall(options: &InstallOptions) -> anyhow::Result<()> {
         macos::uninstall_app_bundles(options)
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        let result = match linux::default_install_roots() {
+            Some(roots) => linux::uninstall_user_scoped(
+                options,
+                &roots,
+                linux::default_autostart_config_home().as_deref(),
+            ),
+            None => linux::uninstall_desktop_entries(options),
+        };
+        // 勾选“移除本体数据”时按 manifest 一并移除受管版本目录。
+        if result.is_ok()
+            && options.remove_owned_data
+            && let Some(roots) = linux::default_install_roots()
+        {
+            let _ = linux::uninstall_user_application(&roots.library_root);
+        }
+        result
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = options;
         anyhow::bail!("当前平台暂不支持卸载 Codex++ 入口")
@@ -230,6 +291,13 @@ fn entrypoint_candidates(root: &Option<PathBuf>, manager: bool) -> Vec<PathBuf> 
         vec![root.join(format!("{name}.lnk"))]
     } else if cfg!(target_os = "macos") {
         vec![root.join(format!("{name}.app"))]
+    } else if cfg!(target_os = "linux") {
+        let file_name = if manager {
+            linux::MANAGER_DESKTOP_FILE
+        } else {
+            linux::SILENT_DESKTOP_FILE
+        };
+        vec![root.join(file_name)]
     } else {
         vec![root.join(format!("{name}.desktop"))]
     }
