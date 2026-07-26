@@ -632,13 +632,20 @@ fn normalize_active_workspace_roots(value: &Value) -> Value {
 }
 
 fn dedupe_paths(paths: Vec<String>) -> Vec<String> {
+    dedupe_paths_for_style(paths, current_desktop_path_style())
+}
+
+fn dedupe_paths_for_style(paths: Vec<String>, style: DesktopPathStyle) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
-    for path in paths {
-        let comparable = path
-            .replace('/', r"\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase();
+    for raw in paths {
+        let Some(path) = normalize_desktop_path_for_style(&raw, style) else {
+            continue;
+        };
+        let comparable = match style {
+            DesktopPathStyle::Windows => path.to_ascii_lowercase(),
+            DesktopPathStyle::Unix => path.clone(),
+        };
         if seen.insert(comparable) {
             result.push(path);
         }
@@ -678,16 +685,56 @@ fn dedupe_strings(items: Vec<String>) -> Vec<String> {
     result
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopPathStyle {
+    Windows,
+    Unix,
+}
+
+fn current_desktop_path_style() -> DesktopPathStyle {
+    if cfg!(windows) {
+        DesktopPathStyle::Windows
+    } else {
+        DesktopPathStyle::Unix
+    }
+}
+
 fn normalize_desktop_path(value: &str) -> Option<String> {
+    normalize_desktop_path_for_style(value, current_desktop_path_style())
+}
+
+fn normalize_desktop_path_for_style(
+    value: &str,
+    style: DesktopPathStyle,
+) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let mut path = trimmed.replace('/', r"\");
-    while path.len() > 3 && path.ends_with('\\') {
-        path.pop();
+
+    match style {
+        DesktopPathStyle::Windows => {
+            let mut path = trimmed.replace('/', r"\");
+            while path.len() > 3 && path.ends_with('\\') {
+                path.pop();
+            }
+            Some(path)
+        }
+        DesktopPathStyle::Unix => {
+            let mut path = if trimmed.starts_with('\\')
+                && !trimmed.starts_with(r"\\")
+                && !trimmed.contains('/')
+            {
+                trimmed.replace('\\', "/")
+            } else {
+                trimmed.to_string()
+            };
+            while path.len() > 1 && path.ends_with('/') {
+                path.pop();
+            }
+            Some(path)
+        }
     }
-    Some(path)
 }
 
 fn create_backup(home: &Path, original: &Value) -> anyhow::Result<PathBuf> {
@@ -721,4 +768,63 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{
+        DesktopPathStyle, dedupe_paths_for_style, normalize_desktop_path_for_style,
+    };
+
+    #[test]
+    fn unix_paths_keep_forward_slashes_and_repair_legacy_backslashes() {
+        assert_eq!(
+            normalize_desktop_path_for_style("/data/Projects/App/", DesktopPathStyle::Unix),
+            Some("/data/Projects/App".to_string())
+        );
+        assert_eq!(
+            normalize_desktop_path_for_style(
+                r"\home\Zyphorix\Documents\App",
+                DesktopPathStyle::Unix,
+            ),
+            Some("/home/Zyphorix/Documents/App".to_string())
+        );
+    }
+
+    #[test]
+    fn unix_deduplication_is_case_sensitive() {
+        assert_eq!(
+            dedupe_paths_for_style(
+                vec![
+                    "/work/App".into(),
+                    "/work/app".into(),
+                    "/work/App/".into(),
+                ],
+                DesktopPathStyle::Unix,
+            ),
+            vec!["/work/App", "/work/app"]
+        );
+    }
+
+    #[test]
+    fn windows_paths_keep_drive_and_unc_semantics() {
+        assert_eq!(
+            normalize_desktop_path_for_style("C:/work/app/", DesktopPathStyle::Windows),
+            Some(r"C:\work\app".to_string())
+        );
+        assert_eq!(
+            dedupe_paths_for_style(
+                vec!["C:/work/App".into(), "C:\\work\\app\\".into()],
+                DesktopPathStyle::Windows,
+            ),
+            vec![r"C:\work\App"]
+        );
+        assert_eq!(
+            normalize_desktop_path_for_style(
+                r"\\server\share\project\",
+                DesktopPathStyle::Windows,
+            ),
+            Some(r"\\server\share\project".to_string())
+        );
+    }
 }
