@@ -336,7 +336,7 @@ fn safe_snapshot_from_state(state: &Map<String, Value>) -> Value {
         if let Some(value) = state.get(*key).and_then(Value::as_object) {
             safe.insert(
                 (*key).to_string(),
-                Value::Object(normalize_string_keyed_map(value)),
+                Value::Object(normalize_thread_state_map(key, value)),
             );
         }
     }
@@ -394,7 +394,7 @@ fn normalize_current_state(state: &mut Map<String, Value>, changed: &mut BTreeSe
     }
     for key in THREAD_STATE_MAP_KEYS {
         if let Some(value) = state.get(*key).and_then(Value::as_object) {
-            let next = Value::Object(normalize_string_keyed_map(value));
+            let next = Value::Object(normalize_thread_state_map(key, value));
             replace_if_changed(state, key, next, changed);
         }
     }
@@ -443,7 +443,7 @@ fn merge_safe_snapshot(
     for key in THREAD_STATE_MAP_KEYS {
         let snapshot_map = snapshot.get(*key).and_then(Value::as_object);
         let current_map = target.get(*key).and_then(Value::as_object);
-        let merged = merge_string_keyed_maps(snapshot_map, current_map);
+        let merged = merge_thread_state_maps(key, snapshot_map, current_map);
         if !merged.is_empty() {
             replace_if_changed(target, key, Value::Object(merged), changed);
         }
@@ -536,18 +536,19 @@ fn merge_path_keyed_maps(
     merged
 }
 
-fn merge_string_keyed_maps(
+fn merge_thread_state_maps(
+    state_key: &str,
     snapshot: Option<&Map<String, Value>>,
     current: Option<&Map<String, Value>>,
 ) -> Map<String, Value> {
     let mut merged = Map::new();
     if let Some(snapshot) = snapshot {
-        for (key, value) in normalize_string_keyed_map(snapshot) {
+        for (key, value) in normalize_thread_state_map(state_key, snapshot) {
             merged.insert(key, value);
         }
     }
     if let Some(current) = current {
-        for (key, value) in normalize_string_keyed_map(current) {
+        for (key, value) in normalize_thread_state_map(state_key, current) {
             merged.insert(key, value);
         }
     }
@@ -564,15 +565,58 @@ fn normalize_path_keyed_map(map: &Map<String, Value>) -> Map<String, Value> {
     next
 }
 
-fn normalize_string_keyed_map(map: &Map<String, Value>) -> Map<String, Value> {
+fn normalize_thread_state_map(state_key: &str, map: &Map<String, Value>) -> Map<String, Value> {
     let mut next = Map::new();
-    for (key, value) in map {
-        let key = key.trim();
-        if !key.is_empty() {
-            next.insert(key.to_string(), value.clone());
+    for (thread_id, value) in map {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            continue;
         }
+        let value = match state_key {
+            "thread-workspace-root-hints" => normalize_workspace_hint(value),
+            "thread-projectless-output-directories" => normalize_path_string(value),
+            "thread-writable-roots" => normalize_writable_roots(value),
+            _ => value.clone(),
+        };
+        next.insert(thread_id.to_string(), value);
     }
     next
+}
+
+fn normalize_path_string(value: &Value) -> Value {
+    value
+        .as_str()
+        .and_then(normalize_desktop_path)
+        .map(Value::String)
+        .unwrap_or_else(|| value.clone())
+}
+
+fn normalize_workspace_hint(value: &Value) -> Value {
+    if value.is_string() {
+        return normalize_path_string(value);
+    }
+    let Some(mut object) = value.as_object().cloned() else {
+        return value.clone();
+    };
+    if let Some(workspace_root) = object.get("workspaceRoot").cloned() {
+        object.insert(
+            "workspaceRoot".to_string(),
+            normalize_path_string(&workspace_root),
+        );
+    }
+    Value::Object(object)
+}
+
+fn normalize_writable_roots(value: &Value) -> Value {
+    if !value.is_array() && !value.is_string() {
+        return value.clone();
+    }
+    Value::Array(
+        dedupe_paths(path_array(value))
+            .into_iter()
+            .map(Value::String)
+            .collect(),
+    )
 }
 
 fn path_array(value: &Value) -> Vec<String> {
@@ -672,10 +716,7 @@ fn normalize_desktop_path(value: &str) -> Option<String> {
     normalize_desktop_path_for_style(value, current_desktop_path_style())
 }
 
-fn normalize_desktop_path_for_style(
-    value: &str,
-    style: DesktopPathStyle,
-) -> Option<String> {
+fn normalize_desktop_path_for_style(value: &str, style: DesktopPathStyle) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
@@ -741,9 +782,7 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod path_tests {
-    use super::{
-        DesktopPathStyle, dedupe_paths_for_style, normalize_desktop_path_for_style,
-    };
+    use super::{DesktopPathStyle, dedupe_paths_for_style, normalize_desktop_path_for_style};
 
     #[test]
     fn unix_paths_keep_forward_slashes_and_repair_legacy_backslashes() {
@@ -764,11 +803,7 @@ mod path_tests {
     fn unix_deduplication_is_case_sensitive() {
         assert_eq!(
             dedupe_paths_for_style(
-                vec![
-                    "/work/App".into(),
-                    "/work/app".into(),
-                    "/work/App/".into(),
-                ],
+                vec!["/work/App".into(), "/work/app".into(), "/work/App/".into(),],
                 DesktopPathStyle::Unix,
             ),
             vec!["/work/App", "/work/app"]
@@ -789,10 +824,7 @@ mod path_tests {
             vec![r"C:\work\App"]
         );
         assert_eq!(
-            normalize_desktop_path_for_style(
-                r"\\server\share\project\",
-                DesktopPathStyle::Windows,
-            ),
+            normalize_desktop_path_for_style(r"\\server\share\project\", DesktopPathStyle::Windows,),
             Some(r"\\server\share\project".to_string())
         );
     }

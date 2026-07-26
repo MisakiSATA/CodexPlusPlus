@@ -80,11 +80,7 @@ fn app_state_sync_restores_safe_state_and_ignores_sensitive_snapshot_keys() {
             json!({"thread-1": "/work/app/out"});
         initial_state["thread-writable-roots"] = json!({"thread-1": ["/work/app"]});
     }
-    std::fs::write(
-        &state_path,
-        initial_state.to_string(),
-    )
-    .unwrap();
+    std::fs::write(&state_path, initial_state.to_string()).unwrap();
 
     let snapshot_path = capture_app_state_snapshot(home)
         .unwrap()
@@ -92,11 +88,7 @@ fn app_state_sync_restores_safe_state_and_ignores_sensitive_snapshot_keys() {
     assert!(snapshot_path.is_file());
     let snapshot: Value =
         serde_json::from_str(&std::fs::read_to_string(&snapshot_path).unwrap()).unwrap();
-    assert!(
-        snapshot["state"]
-            .get("active-workspace-roots")
-            .is_none()
-    );
+    assert!(snapshot["state"].get("active-workspace-roots").is_none());
 
     let fresh_path = if cfg!(windows) {
         "D:/fresh/app"
@@ -152,19 +144,23 @@ fn app_state_sync_restores_safe_state_and_ignores_sensitive_snapshot_keys() {
     assert_eq!(
         state["thread-workspace-root-hints"]["thread-1"],
         if cfg!(windows) {
-            "C:/work/app"
+            "C:\\work\\app"
         } else {
             "/work/app"
         }
     );
     assert_eq!(
         state["thread-workspace-root-hints"]["thread-3"],
-        fresh_path
+        if cfg!(windows) {
+            "D:\\fresh\\app"
+        } else {
+            fresh_path
+        }
     );
     assert_eq!(
         state["thread-projectless-output-directories"]["thread-1"],
         if cfg!(windows) {
-            "C:/work/app/out"
+            "C:\\work\\app\\out"
         } else {
             "/work/app/out"
         }
@@ -172,7 +168,7 @@ fn app_state_sync_restores_safe_state_and_ignores_sensitive_snapshot_keys() {
     assert_eq!(
         state["thread-writable-roots"]["thread-1"],
         if cfg!(windows) {
-            json!(["C:/work/app"])
+            json!(["C:\\work\\app"])
         } else {
             json!(["/work/app"])
         }
@@ -339,6 +335,61 @@ fn app_state_sync_repairs_legacy_linux_project_paths() {
         json!({"/home/Zyphorix/Documents/App": "App"})
     );
     assert!(result.backup_path.unwrap().is_dir());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn app_state_sync_repairs_known_thread_workspace_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    std::fs::write(
+        home.join(".codex-global-state.json"),
+        json!({
+            "thread-workspace-root-hints": {
+                "thread-1": r"\data\Projects\One",
+                "thread-2": {
+                    "workspaceRoot": r"\home\Zyphorix\Two",
+                    "keep": true
+                }
+            },
+            "thread-projectless-output-directories": {
+                "thread-1": r"\data\Projects\One\out"
+            },
+            "thread-writable-roots": {
+                "thread-1": [r"\data\Projects\One", r"\data\Projects\One"]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let result = sync_app_state_after_provider_switch(home).unwrap();
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.join(".codex-global-state.json")).unwrap(),
+    )
+    .unwrap();
+
+    assert!(result.changed);
+    assert_eq!(
+        state["thread-workspace-root-hints"]["thread-1"],
+        "/data/Projects/One"
+    );
+    assert_eq!(
+        state["thread-workspace-root-hints"]["thread-2"]["workspaceRoot"],
+        "/home/Zyphorix/Two"
+    );
+    assert_eq!(
+        state["thread-workspace-root-hints"]["thread-2"]["keep"],
+        true
+    );
+    assert_eq!(
+        state["thread-projectless-output-directories"]["thread-1"],
+        "/data/Projects/One/out"
+    );
+    assert_eq!(
+        state["thread-writable-roots"]["thread-1"],
+        json!(["/data/Projects/One"])
+    );
 }
 
 #[test]
