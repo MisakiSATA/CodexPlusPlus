@@ -10,6 +10,7 @@ pub mod codex_local_storage;
 pub mod codex_sqlite;
 mod computer_use_guard;
 pub mod diagnostic_log;
+pub mod display_backend;
 pub mod dream_skin;
 pub mod dream_skin_library;
 pub mod dream_skin_market;

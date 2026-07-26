@@ -4039,7 +4039,14 @@ fn diagnostics_report() -> String {
         },
         "platform": {
             "os": std::env::consts::OS,
-            "arch": std::env::consts::ARCH
+            "arch": std::env::consts::ARCH,
+            // Linux 迁移要求诊断能看到会话类型与实际显示后端。
+            "displayBackend": if cfg!(target_os = "linux") {
+                serde_json::to_value(codex_plus_core::display_backend::display_backend_diagnostics())
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            }
         }
     }))
     .unwrap_or_else(|error| format!("诊断报告序列化失败：{error}"))
