@@ -11,6 +11,8 @@ pub const DEFAULT_LATEST_JSON_URL: &str =
 pub struct ReleaseAsset {
     pub name: String,
     pub browser_download_url: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +22,9 @@ pub struct Release {
     pub body: String,
     pub asset_name: Option<String>,
     pub asset_url: Option<String>,
+    /// Linux 便携包必需的 SHA-256 摘要；缺失时 Linux 更新会被拒绝。
+    #[serde(default)]
+    pub asset_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -82,10 +87,14 @@ pub fn release_from_github_payload(payload: &Value) -> anyhow::Result<Release> {
             Some((
                 asset.get("name")?.as_str()?.to_string(),
                 asset.get("browser_download_url")?.as_str()?.to_string(),
+                asset
+                    .get("digest")
+                    .and_then(Value::as_str)
+                    .and_then(digest_hex),
             ))
         })
         .collect::<Vec<_>>();
-    let selected = select_update_asset(&assets);
+    let selected = select_update_asset_with_digests(&assets);
     Ok(Release {
         version,
         url: payload
@@ -99,6 +108,7 @@ pub fn release_from_github_payload(payload: &Value) -> anyhow::Result<Release> {
             .unwrap_or_default()
             .to_string(),
         asset_name: selected.as_ref().map(|asset| asset.name.clone()),
+        asset_sha256: selected.as_ref().and_then(|asset| asset.sha256.clone()),
         asset_url: selected.map(|asset| asset.browser_download_url),
     })
 }
@@ -122,10 +132,20 @@ pub fn release_from_latest_json_payload(payload: &Value) -> anyhow::Result<Relea
                 .or_else(|| asset.get("browser_download_url"))?
                 .as_str()?
                 .to_string();
-            Some((name, url))
+            let sha256 = asset
+                .get("sha256")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    asset
+                        .get("digest")
+                        .and_then(Value::as_str)
+                        .and_then(digest_hex)
+                });
+            Some((name, url, sha256))
         })
         .collect::<Vec<_>>();
-    let selected = select_update_asset(&assets);
+    let selected = select_update_asset_with_digests(&assets);
     Ok(Release {
         version,
         url: payload
@@ -142,27 +162,47 @@ pub fn release_from_latest_json_payload(payload: &Value) -> anyhow::Result<Relea
             .unwrap_or_default()
             .to_string(),
         asset_name: selected.as_ref().map(|asset| asset.name.clone()),
+        asset_sha256: selected.as_ref().and_then(|asset| asset.sha256.clone()),
         asset_url: selected.map(|asset| asset.browser_download_url),
     })
 }
 
+/// 从 GitHub API 的 `digest` 字段（形如 `sha256:<hex>`）提取十六进制摘要。
+fn digest_hex(digest: &str) -> Option<String> {
+    digest
+        .strip_prefix("sha256:")
+        .map(|hex| hex.trim().to_string())
+        .filter(|hex| !hex.is_empty())
+}
+
 pub fn select_update_asset(assets: &[(String, String)]) -> Option<ReleaseAsset> {
+    let assets = assets
+        .iter()
+        .map(|(name, url)| (name.clone(), url.clone(), None))
+        .collect::<Vec<_>>();
+    select_update_asset_with_digests(&assets)
+}
+
+pub fn select_update_asset_with_digests(
+    assets: &[(String, String, Option<String>)],
+) -> Option<ReleaseAsset> {
     let named = assets
         .iter()
-        .filter(|(name, url)| !name.trim().is_empty() && !url.trim().is_empty());
-    let mut best: Option<(u8, &str, &str)> = None;
-    for (name, url) in named {
+        .filter(|(name, url, _)| !name.trim().is_empty() && !url.trim().is_empty());
+    let mut best: Option<(u8, &str, &str, Option<&str>)> = None;
+    for (name, url, sha256) in named {
         let rank = platform_asset_rank(&name.to_ascii_lowercase());
         if rank >= 2 {
             continue;
         }
-        if best.map_or(true, |(r, _, _)| rank < r) {
-            best = Some((rank, name.as_str(), url.as_str()));
+        if best.map_or(true, |(r, _, _, _)| rank < r) {
+            best = Some((rank, name.as_str(), url.as_str(), sha256.as_deref()));
         }
     }
-    best.map(|(_, name, url)| ReleaseAsset {
+    best.map(|(_, name, url, sha256)| ReleaseAsset {
         name: name.to_string(),
         browser_download_url: url.to_string(),
+        sha256: sha256.map(str::to_string),
     })
 }
 
@@ -210,12 +250,56 @@ pub async fn perform_update(
             .bytes()
             .await?;
     let installer_path = download_asset_to(release, &bytes, download_dir)?;
-    launch_installer(&installer_path)?;
-    Ok(UpdateInstall {
-        release: release.clone(),
-        installer_path,
-        launched: true,
-    })
+
+    #[cfg(target_os = "linux")]
+    {
+        let launched = install_linux_portable_update(release, &bytes)?;
+        Ok(UpdateInstall {
+            release: release.clone(),
+            installer_path,
+            launched,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        launch_installer(&installer_path)?;
+        Ok(UpdateInstall {
+            release: release.clone(),
+            installer_path,
+            launched: true,
+        })
+    }
+}
+
+/// Linux 更新闭环：校验摘要、分级解压进新版本目录并原子切换 `current`，
+/// 成功后启动新版管理工具展示更新结果。
+#[cfg(target_os = "linux")]
+fn install_linux_portable_update(release: &Release, bytes: &[u8]) -> anyhow::Result<bool> {
+    let Some(expected_sha256) = release.asset_sha256.as_deref() else {
+        anyhow::bail!("Linux 更新包缺少 SHA-256 摘要，已拒绝安装");
+    };
+    let Some(roots) = crate::install::linux::default_install_roots() else {
+        anyhow::bail!("无法解析当前用户的 XDG 目录");
+    };
+    let version = release.version.trim().trim_start_matches(['v', 'V']);
+    if version.is_empty() {
+        anyhow::bail!("Release 缺少版本号");
+    }
+    let installed =
+        crate::install::linux::install_update_archive(bytes, expected_sha256, &roots, version)?;
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "update.linux_portable_installed",
+        serde_json::json!({
+            "version": version,
+            "versionDir": installed.version_dir.to_string_lossy(),
+        }),
+    );
+    let launched = std::process::Command::new(&installed.manager_path)
+        .arg("--show-update")
+        .spawn()
+        .is_ok();
+    Ok(launched)
 }
 
 pub fn download_asset_to(
@@ -268,7 +352,23 @@ fn platform_asset_rank(name: &str) -> u8 {
     if cfg!(windows) && is_windows_installer_asset(name) {
         return 0;
     }
+    if cfg!(target_os = "linux") && is_linux_portable_asset(name) {
+        return 0;
+    }
     2
+}
+
+/// Linux 仅接受与当前架构匹配的便携 zip（如 `...-linux-x64.zip`）。
+fn is_linux_portable_asset(name: &str) -> bool {
+    let arch_token = match std::env::consts::ARCH {
+        "x86_64" => "linux-x64",
+        "aarch64" => "linux-arm64",
+        _ => return false,
+    };
+    name.contains("codex")
+        && name.contains("plus")
+        && name.contains(arch_token)
+        && name.ends_with(".zip")
 }
 
 fn is_macos_native_arch_asset(name: &str) -> bool {
@@ -338,6 +438,6 @@ pub fn launch_installer(path: &Path) -> anyhow::Result<()> {
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         let _ = path;
-        anyhow::bail!("当前平台不支持启动安装包")
+        anyhow::bail!("当前平台通过便携包直接安装更新，不使用安装器")
     }
 }

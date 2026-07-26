@@ -397,6 +397,215 @@ fn staging_path(target: &Path) -> anyhow::Result<PathBuf> {
     )))
 }
 
+pub const UPDATE_ROLLBACK_FILE: &str = "update-rollback.json";
+
+/// 校验摘要后把便携更新包分级解压为新版本目录并原子切换 `current`。
+/// 旧的 `current` 目标写入回滚元数据，供 `rollback_update` 恢复。
+#[cfg(target_os = "linux")]
+pub fn install_update_archive(
+    archive: &[u8],
+    expected_sha256: &str,
+    roots: &LinuxInstallRoots,
+    version: &str,
+) -> anyhow::Result<LinuxUserInstall> {
+    use sha2::Digest;
+
+    let actual = format!("{:x}", sha2::Sha256::digest(archive));
+    if !actual.eq_ignore_ascii_case(expected_sha256.trim()) {
+        anyhow::bail!("更新包 SHA-256 校验失败：期望 {expected_sha256}，实际 {actual}");
+    }
+
+    let versions_dir = roots.library_root.join("versions");
+    std::fs::create_dir_all(&versions_dir)?;
+    let staging_dir = versions_dir.join(format!(".staging-{version}-{}", std::process::id()));
+    if staging_dir.exists() {
+        std::fs::remove_dir_all(&staging_dir)?;
+    }
+    let extraction = extract_update_archive(archive, &staging_dir);
+    if let Err(error) = extraction {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
+
+    // 校验并授予可执行权限，失败时清理暂存目录。
+    if let Err(error) = finalize_staged_binaries(&staging_dir) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
+
+    let version_dir = versions_dir.join(version);
+    let replaced_dir = versions_dir.join(format!(".replaced-{version}-{}", std::process::id()));
+    if version_dir.exists() {
+        std::fs::rename(&version_dir, &replaced_dir)?;
+    }
+    if let Err(error) = std::fs::rename(&staging_dir, &version_dir) {
+        if replaced_dir.exists() {
+            let _ = std::fs::rename(&replaced_dir, &version_dir);
+        }
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(error.into());
+    }
+    if replaced_dir.exists() {
+        let _ = std::fs::remove_dir_all(&replaced_dir);
+    }
+
+    write_rollback_metadata(&roots.library_root)?;
+    let current_link = activate_version(&roots.library_root, &version_dir)?;
+
+    let launcher_path = current_link.join("bin").join(SILENT_BINARY);
+    let manager_path = current_link.join("bin").join(MANAGER_BINARY);
+    Ok(LinuxUserInstall {
+        launcher_path,
+        manager_path,
+        version_dir,
+        current_link,
+        silent_entry: roots.applications_dir.join(SILENT_DESKTOP_FILE),
+        manager_entry: roots.applications_dir.join(MANAGER_DESKTOP_FILE),
+        icon_path: icon_install_path(&roots.icons_dir),
+    })
+}
+
+/// 把 `current` 恢复到上一次激活的版本目录。
+#[cfg(target_os = "linux")]
+pub fn rollback_update(library_root: &Path) -> anyhow::Result<PathBuf> {
+    let metadata_path = library_root.join(UPDATE_ROLLBACK_FILE);
+    let contents = std::fs::read_to_string(&metadata_path)
+        .map_err(|error| anyhow::anyhow!("没有可用的回滚信息：{error}"))?;
+    let metadata: serde_json::Value = serde_json::from_str(&contents)?;
+    if metadata.get("managedBy").and_then(|value| value.as_str()) != Some(INSTALL_MANAGED_BY) {
+        anyhow::bail!("回滚信息不受 Codex++ 管理，已拒绝");
+    }
+    let previous = metadata
+        .get("previousTarget")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("回滚信息缺少上一版本目录"))?;
+    let previous_relative = Path::new(previous);
+    if previous_relative.is_absolute()
+        || previous_relative
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("回滚目标路径非法：{previous}");
+    }
+    let previous_dir = library_root.join(previous_relative);
+    if !previous_dir.is_dir() {
+        anyhow::bail!("上一版本目录不存在：{}", previous_dir.to_string_lossy());
+    }
+    let current_link = activate_version(library_root, &previous_dir)?;
+    let _ = std::fs::remove_file(&metadata_path);
+    Ok(current_link)
+}
+
+#[cfg(target_os = "linux")]
+fn write_rollback_metadata(library_root: &Path) -> anyhow::Result<()> {
+    let current_link = library_root.join(CURRENT_LINK_NAME);
+    let Ok(previous_target) = std::fs::read_link(&current_link) else {
+        // 首次安装没有旧版本，无需回滚信息。
+        return Ok(());
+    };
+    let metadata = serde_json::json!({
+        "managedBy": INSTALL_MANAGED_BY,
+        "previousTarget": previous_target.to_string_lossy(),
+    });
+    write_file_atomically(
+        &library_root.join(UPDATE_ROLLBACK_FILE),
+        serde_json::to_string_pretty(&metadata)?.as_bytes(),
+    )
+}
+
+/// 解压便携更新包。逐项拒绝绝对路径、越界、符号链接、重复目标
+/// 以及 manifest 未声明的文件。
+#[cfg(target_os = "linux")]
+fn extract_update_archive(archive: &[u8], target_dir: &Path) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+    use std::io::Read;
+
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive))?;
+
+    // 第一遍：读取并校验 manifest。
+    let manifest_contents = {
+        let mut file = zip
+            .by_name(INSTALL_MANIFEST_FILE)
+            .map_err(|_| anyhow::anyhow!("更新包缺少 {INSTALL_MANIFEST_FILE}"))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        contents
+    };
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_contents)?;
+    if manifest.get("managedBy").and_then(|value| value.as_str()) != Some(INSTALL_MANAGED_BY) {
+        anyhow::bail!("更新包 manifest 缺少 Codex++ 管理标记");
+    }
+    let allowed = manifest
+        .get("files")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    for required in [
+        format!("bin/{SILENT_BINARY}"),
+        format!("bin/{MANAGER_BINARY}"),
+    ] {
+        if !allowed.contains(&required) {
+            anyhow::bail!("更新包 manifest 缺少必需文件：{required}");
+        }
+    }
+
+    // 第二遍：逐项校验并写入暂存目录。
+    std::fs::create_dir_all(target_dir)?;
+    let mut seen = HashSet::new();
+    for index in 0..zip.len() {
+        let mut entry = zip.by_index(index)?;
+        if entry.is_dir() {
+            continue;
+        }
+        let raw_name = entry.name().to_string();
+        let Some(relative) = entry.enclosed_name() else {
+            anyhow::bail!("更新包内路径非法：{raw_name}");
+        };
+        if relative.is_absolute() {
+            anyhow::bail!("更新包内路径非法：{raw_name}");
+        }
+        // 拒绝符号链接条目，防止解压后逃逸出版本目录。
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            anyhow::bail!("更新包内含符号链接：{raw_name}");
+        }
+        let normalized = relative.to_string_lossy().to_string();
+        if !seen.insert(normalized.clone()) {
+            anyhow::bail!("更新包内目标重复：{raw_name}");
+        }
+        if normalized != INSTALL_MANIFEST_FILE && !allowed.contains(&normalized) {
+            anyhow::bail!("更新包内文件未在 manifest 声明：{raw_name}");
+        }
+        let target = target_dir.join(&relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut output = std::fs::File::create(&target)?;
+        std::io::copy(&mut entry, &mut output)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn finalize_staged_binaries(staging_dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for binary in [SILENT_BINARY, MANAGER_BINARY] {
+        let path = staging_dir.join("bin").join(binary);
+        let metadata = std::fs::metadata(&path)
+            .map_err(|_| anyhow::anyhow!("更新包缺少二进制：bin/{binary}"))?;
+        if metadata.len() == 0 {
+            anyhow::bail!("更新包内二进制为空：bin/{binary}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
 /// 尽力刷新桌面数据库、图标缓存并注册协议处理器。
 /// 缺少这些工具只影响菜单刷新速度，因此仅返回警告而不视为安装失败。
 #[cfg(target_os = "linux")]
