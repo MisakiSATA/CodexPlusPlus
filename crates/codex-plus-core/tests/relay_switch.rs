@@ -344,9 +344,15 @@ fn switch_captures_safe_app_state_before_writing_provider_config() {
         .unwrap(),
     )
     .unwrap();
+    // 路径按当前平台风格规范化：Windows 归一化为反斜杠，Unix 原样保留。
+    let expected_root = if cfg!(windows) {
+        "C:\\work\\app"
+    } else {
+        "C:/work/app"
+    };
     assert_eq!(
         snapshot["state"]["electron-saved-workspace-roots"],
-        serde_json::json!(["C:\\work\\app"])
+        serde_json::json!([expected_root])
     );
     assert_eq!(
         snapshot["state"]["electron-persisted-atom-state"]["default-service-tier"],

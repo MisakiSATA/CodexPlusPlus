@@ -4218,10 +4218,13 @@ mod tests {
 
         let state: Value =
             serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
-        assert_eq!(
-            state["electron-saved-workspace-roots"],
+        // 路径按当前平台风格规范化：Windows 归一化为反斜杠，Unix 原样保留。
+        let expected_roots = if cfg!(windows) {
             json!(["D:\\fresh\\app", "C:\\work\\app"])
-        );
+        } else {
+            json!(["D:/fresh/app", "C:/work/app"])
+        };
+        assert_eq!(state["electron-saved-workspace-roots"], expected_roots);
         assert_eq!(
             state["thread-writable-roots"]["thread-1"],
             json!(["C:/work/app"])

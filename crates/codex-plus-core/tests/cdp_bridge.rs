@@ -445,9 +445,13 @@ fn injection_script_installs_dream_skin_from_backend_settings() {
     ));
     assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__"));
     assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__"));
-    assert!(!script.contains(
-        "attributeFilter: [\"class\", \"data-theme\", \"data-appearance\", \"data-color-mode\", \"style\"]"
-    ));
+    if cfg!(windows) {
+        // 仅 Windows 渲染器移除了该 observer 过滤；非 Windows 构建嵌入的
+        // macOS 上游渲染器仍包含它。
+        assert!(!script.contains(
+            "attributeFilter: [\"class\", \"data-theme\", \"data-appearance\", \"data-color-mode\", \"style\"]"
+        ));
+    }
     assert!(script.contains("codexAppDreamSkinEnabled"));
     assert!(script.contains("codexAppDreamSkinPaused"));
     assert!(script.contains("codexAppDreamSkinThemeConfig"));
