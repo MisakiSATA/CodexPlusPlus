@@ -399,6 +399,14 @@ fn staging_path(target: &Path) -> anyhow::Result<PathBuf> {
 
 pub const UPDATE_ROLLBACK_FILE: &str = "update-rollback.json";
 
+/// 判断二进制是否由系统包管理器安装（`.deb`/`.rpm`/pacman 布局）。
+/// 这类安装的文件归包管理器所有，应用内自更新必须拒绝执行。
+pub fn is_system_managed_install(executable: &Path) -> bool {
+    ["/usr/", "/opt/"]
+        .iter()
+        .any(|prefix| executable.starts_with(prefix))
+}
+
 /// 校验摘要后把便携更新包分级解压为新版本目录并原子切换 `current`。
 /// 旧的 `current` 目标写入回滚元数据，供 `rollback_update` 恢复。
 #[cfg(target_os = "linux")]

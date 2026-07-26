@@ -1,0 +1,53 @@
+# Codex++ Arch Linux 二进制包（从发布的便携 zip 重新打包）。
+# 本地构建：
+#   1. 把 CodexPlusPlus-<pkgver>-linux-x64.zip 放到本目录
+#      （或先运行 scripts/installer/linux/package-portable.sh 生成后复制过来）
+#   2. makepkg -f
+#   3. sudo pacman -U codex-plus-plus-bin-<pkgver>-1-x86_64.pkg.tar.zst
+# 系统包安装的 Codex++ 请用 pacman 更新，应用内自更新已被禁用。
+pkgname=codex-plus-plus-bin
+pkgver=1.2.42
+pkgrel=1
+pkgdesc="Codex desktop enhancements and provider manager (binary release)"
+arch=('x86_64')
+url="https://github.com/MisakiSATA/CodexPlusPlus"
+license=('MIT')
+depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator')
+provides=('codex-plus-plus')
+conflicts=('codex-plus-plus')
+options=('!strip')
+source=("CodexPlusPlus-${pkgver}-linux-x64.zip")
+sha256sums=('SKIP')
+
+package() {
+  install -Dm755 "$srcdir/bin/codex-plus-plus" "$pkgdir/usr/bin/codex-plus-plus"
+  install -Dm755 "$srcdir/bin/codex-plus-plus-manager" "$pkgdir/usr/bin/codex-plus-plus-manager"
+  install -Dm644 "$srcdir/share/icon.png" \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/codex-plus-plus.png"
+
+  install -dm755 "$pkgdir/usr/share/applications"
+  cat > "$pkgdir/usr/share/applications/codex-plus-plus.desktop" <<'ENTRY'
+[Desktop Entry]
+Type=Application
+Name=Codex++
+Comment=Launch OpenAI Codex with Codex++ enhancements
+Exec=/usr/bin/codex-plus-plus %U
+Icon=codex-plus-plus
+Terminal=false
+Categories=Development;
+StartupNotify=true
+MimeType=x-scheme-handler/codexplusplus;
+ENTRY
+  cat > "$pkgdir/usr/share/applications/codex-plus-plus-manager.desktop" <<'ENTRY'
+[Desktop Entry]
+Type=Application
+Name=Codex++ 管理工具
+Comment=Manage Codex++ providers, models and enhancements
+Exec=/usr/bin/codex-plus-plus-manager
+Icon=codex-plus-plus
+Terminal=false
+Categories=Development;
+StartupNotify=true
+ENTRY
+  chmod 644 "$pkgdir/usr/share/applications/"*.desktop
+}

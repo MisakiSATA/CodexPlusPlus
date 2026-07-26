@@ -50,13 +50,40 @@ jobs:
           VERSION="${VERSION#V}"
           bash scripts/installer/linux/package-portable.sh "$VERSION" x64
 
-      - name: Upload Linux portable zip
+      - name: Install rpm tooling
+        run: sudo apt-get install -y rpm
+
+      - name: Build deb and rpm packages
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          VERSION="${VERSION#V}"
+          bash scripts/installer/linux/package-deb.sh "$VERSION"
+          bash scripts/installer/linux/package-rpm.sh "$VERSION"
+
+      - name: Inspect package layout
+        run: |
+          set -euo pipefail
+          DEB="$(ls dist/linux/*.deb)"
+          RPM="$(ls dist/linux/*.rpm)"
+          dpkg-deb --info "$DEB"
+          for path in             ./usr/bin/codex-plus-plus             ./usr/bin/codex-plus-plus-manager             ./usr/share/applications/codex-plus-plus.desktop             ./usr/share/applications/codex-plus-plus-manager.desktop             ./usr/share/icons/hicolor/256x256/apps/codex-plus-plus.png; do
+            dpkg-deb --contents "$DEB" | awk '{print $6}' | grep -qx "$path"
+            rpm -qpl "$RPM" | grep -qx "${path#.}"
+          done
+          echo "package layout verified"
+
+      - name: Upload Linux packages
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name }}
           files: |
             dist/linux/*.zip
             dist/linux/*.zip.sha256
+            dist/linux/*.deb
+            dist/linux/*.deb.sha256
+            dist/linux/*.rpm
+            dist/linux/*.rpm.sha256
 
   latest-json:
     name: Upload static latest.json

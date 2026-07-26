@@ -430,3 +430,22 @@ fn linux_manifest_uninstall_preserves_unmanaged_files() {
     assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "keep me");
     assert!(unmanaged_dir.join("data").exists());
 }
+
+#[test]
+fn system_prefixes_are_recognized_as_package_manager_installs() {
+    use codex_plus_core::install::linux::is_system_managed_install;
+    use std::path::Path;
+
+    assert!(is_system_managed_install(Path::new(
+        "/usr/bin/codex-plus-plus-manager"
+    )));
+    assert!(is_system_managed_install(Path::new(
+        "/opt/codex-plus-plus/bin/codex-plus-plus"
+    )));
+    assert!(!is_system_managed_install(Path::new(
+        "/home/alice/.local/lib/codex-plus-plus/current/bin/codex-plus-plus"
+    )));
+    assert!(!is_system_managed_install(Path::new(
+        "/home/alice/user-projects/codex-plus-plus"
+    )));
+}

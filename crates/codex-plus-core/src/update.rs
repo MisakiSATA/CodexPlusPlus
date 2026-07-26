@@ -276,6 +276,14 @@ pub async fn perform_update(
 /// 成功后启动新版管理工具展示更新结果。
 #[cfg(target_os = "linux")]
 fn install_linux_portable_update(release: &Release, bytes: &[u8]) -> anyhow::Result<bool> {
+    if let Ok(current_exe) = std::env::current_exe()
+        && crate::install::linux::is_system_managed_install(&current_exe)
+    {
+        anyhow::bail!(
+            "当前 Codex++ 由系统包管理器安装（{}），请使用 pacman/apt/dnf 更新，应用内更新已禁用",
+            current_exe.to_string_lossy()
+        );
+    }
     let Some(expected_sha256) = release.asset_sha256.as_deref() else {
         anyhow::bail!("Linux 更新包缺少 SHA-256 摘要，已拒绝安装");
     };
