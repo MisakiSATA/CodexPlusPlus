@@ -90,6 +90,13 @@ fn app_state_sync_restores_safe_state_and_ignores_sensitive_snapshot_keys() {
         .unwrap()
         .expect("snapshot should be created");
     assert!(snapshot_path.is_file());
+    let snapshot: Value =
+        serde_json::from_str(&std::fs::read_to_string(&snapshot_path).unwrap()).unwrap();
+    assert!(
+        snapshot["state"]
+            .get("active-workspace-roots")
+            .is_none()
+    );
 
     let fresh_path = if cfg!(windows) {
         "D:/fresh/app"
@@ -126,9 +133,9 @@ fn app_state_sync_restores_safe_state_and_ignores_sensitive_snapshot_keys() {
     assert_eq!(
         state["active-workspace-roots"],
         if cfg!(windows) {
-            json!(["D:\\fresh\\app", "C:\\work\\app"])
+            json!("D:\\fresh\\app")
         } else {
-            json!(["/fresh/app", "/work/app"])
+            json!("/fresh/app")
         }
     );
     assert_eq!(

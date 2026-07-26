@@ -324,12 +324,6 @@ fn safe_snapshot_from_state(state: &Map<String, Value>) -> Value {
             safe.insert((*key).to_string(), json!(dedupe_paths(path_array(value))));
         }
     }
-    if let Some(value) = state.get(ACTIVE_WORKSPACE_ROOTS_KEY) {
-        safe.insert(
-            ACTIVE_WORKSPACE_ROOTS_KEY.to_string(),
-            normalize_active_workspace_roots(value),
-        );
-    }
     for key in WORKSPACE_PATH_MAP_KEYS {
         if let Some(value) = state.get(*key).and_then(Value::as_object) {
             safe.insert(
@@ -437,31 +431,6 @@ fn merge_safe_snapshot(
         if !paths.is_empty() {
             replace_if_changed(target, key, json!(dedupe_paths(paths)), changed);
         }
-    }
-    let mut active_paths = target
-        .get(ACTIVE_WORKSPACE_ROOTS_KEY)
-        .map(path_array)
-        .unwrap_or_default();
-    active_paths.extend(
-        snapshot
-            .get(ACTIVE_WORKSPACE_ROOTS_KEY)
-            .map(path_array)
-            .unwrap_or_default(),
-    );
-    let active_paths = dedupe_paths(active_paths);
-    if !active_paths.is_empty() {
-        let target_is_array = target
-            .get(ACTIVE_WORKSPACE_ROOTS_KEY)
-            .is_some_and(Value::is_array);
-        let snapshot_is_array = snapshot
-            .get(ACTIVE_WORKSPACE_ROOTS_KEY)
-            .is_some_and(Value::is_array);
-        let next = if target_is_array || snapshot_is_array || active_paths.len() > 1 {
-            json!(active_paths)
-        } else {
-            json!(active_paths[0])
-        };
-        replace_if_changed(target, ACTIVE_WORKSPACE_ROOTS_KEY, next, changed);
     }
     for key in WORKSPACE_PATH_MAP_KEYS {
         let snapshot_map = snapshot.get(*key).and_then(Value::as_object);
