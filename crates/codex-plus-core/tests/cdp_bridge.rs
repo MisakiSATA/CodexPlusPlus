@@ -763,6 +763,21 @@ fn injection_script_keeps_plugin_marketplace_unlock_separate_from_entry_unlock()
 }
 
 #[test]
+fn injection_script_skips_removed_plugin_marketplace_asset_without_retrying() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains(
+        "const module = await loadOptionalCodexAppModule(\"app-server-manager-signals-\")"
+    ));
+    assert!(
+        !script
+            .contains("const module = await loadCodexAppModule(\"app-server-manager-signals-\")")
+    );
+    assert!(script.contains("plugin_marketplace_request_patch_skipped"));
+    assert!(script.contains("reason: \"asset_missing\""));
+}
+
+#[test]
 fn injection_script_localizes_codex_menu_commands() {
     let script = assets::injection_script(57321);
 

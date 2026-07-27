@@ -4382,7 +4382,14 @@
     if (!codexPlusSettings().pluginMarketplaceUnlock) return;
     const patch = async () => {
       try {
-        const module = await loadCodexAppModule("app-server-manager-signals-");
+        const module = await loadOptionalCodexAppModule("app-server-manager-signals-");
+        if (!module) {
+          window.__codexPluginMarketplaceUnlockInstalled = codexPluginMarketplaceUnlockVersion;
+          sendCodexPlusDiagnostic("plugin_marketplace_request_patch_skipped", {
+            reason: "asset_missing",
+          });
+          return;
+        }
         const candidates = Object.values(module).filter((value) => value && typeof value === "object");
         let patchedCount = 0;
         for (const candidate of candidates) {
