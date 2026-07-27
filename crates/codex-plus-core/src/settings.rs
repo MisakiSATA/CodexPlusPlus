@@ -9,6 +9,8 @@ use toml_edit::{DocumentMut, Item};
 
 use crate::zed_remote::ZedOpenStrategy;
 
+mod context;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LaunchMode {
@@ -991,7 +993,7 @@ impl SettingsStore {
             "relayContextConfigContents".to_string(),
             Value::String(settings.relay_context_config_contents.clone()),
         );
-        persist_normalized_context_profile_fields(&mut raw, &settings.relay_profiles);
+        context::persist_profile_fields(&mut raw, &settings.relay_profiles);
         let bytes = serde_json::to_vec_pretty(&Value::Object(raw))?;
         atomic_write(&self.path, &bytes)?;
         Ok(settings)
@@ -1013,40 +1015,6 @@ impl SettingsStore {
             Ok(Value::Object(map)) => Ok(map),
             Ok(_) | Err(_) => Ok(settings_to_object(&BackendSettings::default())),
         }
-    }
-}
-
-fn persist_normalized_context_profile_fields(
-    raw: &mut Map<String, Value>,
-    profiles: &[RelayProfile],
-) {
-    let Some(Value::Array(raw_profiles)) = raw.get_mut("relayProfiles") else {
-        return;
-    };
-    for raw_profile in raw_profiles {
-        let Some(raw_profile) = raw_profile.as_object_mut() else {
-            continue;
-        };
-        let Some(profile) = raw_profile
-            .get("id")
-            .and_then(Value::as_str)
-            .and_then(|id| profiles.iter().find(|profile| profile.id == id))
-        else {
-            continue;
-        };
-        if let Some(config_contents) = raw_profile.get("configContents").and_then(Value::as_str) {
-            let (profile_config, _) = split_context_config_sections(config_contents);
-            raw_profile.insert("configContents".to_string(), Value::String(profile_config));
-        }
-        raw_profile.insert(
-            "contextSelection".to_string(),
-            serde_json::to_value(&profile.context_selection)
-                .unwrap_or_else(|_| Value::Object(Map::new())),
-        );
-        raw_profile.insert(
-            "contextSelectionInitialized".to_string(),
-            Value::Bool(profile.context_selection_initialized),
-        );
     }
 }
 
@@ -1416,42 +1384,9 @@ fn settings_to_object(settings: &BackendSettings) -> Map<String, Value> {
 }
 
 fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendSettings {
-    let (common, extracted_context) =
-        split_context_config_sections(&settings.relay_common_config_contents);
-    let mut context =
-        merge_context_config_sections(&settings.relay_context_config_contents, &extracted_context);
-    settings.relay_common_config_contents = crate::relay_config::normalize_config_text(&common);
+    context::normalize(&mut settings);
     for profile in &mut settings.relay_profiles {
-        let (profile_config, profile_context) =
-            split_context_config_sections(&profile.config_contents);
-        profile.config_contents = profile_config;
-        context = merge_context_config_sections(&context, &profile_context);
         let _ = crate::relay_config::normalize_relay_profile_for_storage(profile);
-    }
-    settings.relay_context_config_contents = crate::relay_config::normalize_config_text(&context);
-    if let Ok(entries) = crate::relay_config::list_context_entries_from_common_config(&context) {
-        let selection = RelayContextSelection {
-            mcp_servers: entries
-                .mcp_servers
-                .into_iter()
-                .map(|entry| entry.id)
-                .collect(),
-            skills: entries.skills.into_iter().map(|entry| entry.id).collect(),
-            plugins: entries.plugins.into_iter().map(|entry| entry.id).collect(),
-        };
-        let should_sync_selection = !selection.mcp_servers.is_empty()
-            || !selection.skills.is_empty()
-            || !selection.plugins.is_empty()
-            || settings
-                .relay_profiles
-                .iter()
-                .any(|profile| profile.context_selection_initialized);
-        if should_sync_selection {
-            for profile in &mut settings.relay_profiles {
-                profile.context_selection = selection.clone();
-                profile.context_selection_initialized = true;
-            }
-        }
     }
     settings.codex_app_image_overlay_opacity =
         clamp_image_overlay_opacity(settings.codex_app_image_overlay_opacity);
@@ -1488,68 +1423,6 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     settings.codex_app_stepwise_timeout_ms =
         clamp_stepwise_timeout_ms(settings.codex_app_stepwise_timeout_ms);
     settings
-}
-
-fn merge_context_config_sections(current: &str, incoming: &str) -> String {
-    let current = current.trim();
-    let incoming = incoming.trim();
-    if current.is_empty() {
-        return normalize_text_config(incoming.to_string());
-    }
-    if incoming.is_empty() {
-        return normalize_text_config(current.to_string());
-    }
-    crate::relay_config::merge_common_config_into_config(incoming, current)
-        .unwrap_or_else(|_| join_config_sections(&[current, incoming]))
-}
-
-fn split_context_config_sections(config: &str) -> (String, String) {
-    let mut common = Vec::new();
-    let mut context = Vec::new();
-    let mut in_context_table = false;
-
-    for line in config.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_context_table = is_context_table_header(trimmed);
-        }
-        if in_context_table {
-            context.push(line);
-        } else {
-            common.push(line);
-        }
-    }
-
-    (
-        normalize_text_config(common.join("\n")),
-        normalize_text_config(context.join("\n")),
-    )
-}
-
-fn is_context_table_header(header: &str) -> bool {
-    matches!(header, "[mcp_servers]" | "[skills]" | "[plugins]")
-        || header.starts_with("[mcp_servers.")
-        || header.starts_with("[skills.")
-        || header.starts_with("[plugins.")
-}
-
-fn join_config_sections(sections: &[&str]) -> String {
-    let joined = sections
-        .iter()
-        .map(|section| section.trim())
-        .filter(|section| !section.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    normalize_text_config(joined)
-}
-
-fn normalize_text_config(contents: String) -> String {
-    let trimmed = contents.trim();
-    if trimmed.is_empty() {
-        String::new()
-    } else {
-        format!("{trimmed}\n")
-    }
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
