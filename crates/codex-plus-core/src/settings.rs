@@ -991,6 +991,7 @@ impl SettingsStore {
             "relayContextConfigContents".to_string(),
             Value::String(settings.relay_context_config_contents.clone()),
         );
+        persist_normalized_context_profile_fields(&mut raw, &settings.relay_profiles);
         let bytes = serde_json::to_vec_pretty(&Value::Object(raw))?;
         atomic_write(&self.path, &bytes)?;
         Ok(settings)
@@ -1012,6 +1013,40 @@ impl SettingsStore {
             Ok(Value::Object(map)) => Ok(map),
             Ok(_) | Err(_) => Ok(settings_to_object(&BackendSettings::default())),
         }
+    }
+}
+
+fn persist_normalized_context_profile_fields(
+    raw: &mut Map<String, Value>,
+    profiles: &[RelayProfile],
+) {
+    let Some(Value::Array(raw_profiles)) = raw.get_mut("relayProfiles") else {
+        return;
+    };
+    for raw_profile in raw_profiles {
+        let Some(raw_profile) = raw_profile.as_object_mut() else {
+            continue;
+        };
+        let Some(profile) = raw_profile
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| profiles.iter().find(|profile| profile.id == id))
+        else {
+            continue;
+        };
+        if let Some(config_contents) = raw_profile.get("configContents").and_then(Value::as_str) {
+            let (profile_config, _) = split_context_config_sections(config_contents);
+            raw_profile.insert("configContents".to_string(), Value::String(profile_config));
+        }
+        raw_profile.insert(
+            "contextSelection".to_string(),
+            serde_json::to_value(&profile.context_selection)
+                .unwrap_or_else(|_| Value::Object(Map::new())),
+        );
+        raw_profile.insert(
+            "contextSelectionInitialized".to_string(),
+            Value::Bool(profile.context_selection_initialized),
+        );
     }
 }
 
@@ -1383,14 +1418,40 @@ fn settings_to_object(settings: &BackendSettings) -> Map<String, Value> {
 fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendSettings {
     let (common, extracted_context) =
         split_context_config_sections(&settings.relay_common_config_contents);
-    let context = join_config_sections(&[
-        settings.relay_context_config_contents.as_str(),
-        extracted_context.as_str(),
-    ]);
+    let mut context =
+        merge_context_config_sections(&settings.relay_context_config_contents, &extracted_context);
     settings.relay_common_config_contents = crate::relay_config::normalize_config_text(&common);
-    settings.relay_context_config_contents = crate::relay_config::normalize_config_text(&context);
     for profile in &mut settings.relay_profiles {
+        let (profile_config, profile_context) =
+            split_context_config_sections(&profile.config_contents);
+        profile.config_contents = profile_config;
+        context = merge_context_config_sections(&context, &profile_context);
         let _ = crate::relay_config::normalize_relay_profile_for_storage(profile);
+    }
+    settings.relay_context_config_contents = crate::relay_config::normalize_config_text(&context);
+    if let Ok(entries) = crate::relay_config::list_context_entries_from_common_config(&context) {
+        let selection = RelayContextSelection {
+            mcp_servers: entries
+                .mcp_servers
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect(),
+            skills: entries.skills.into_iter().map(|entry| entry.id).collect(),
+            plugins: entries.plugins.into_iter().map(|entry| entry.id).collect(),
+        };
+        let should_sync_selection = !selection.mcp_servers.is_empty()
+            || !selection.skills.is_empty()
+            || !selection.plugins.is_empty()
+            || settings
+                .relay_profiles
+                .iter()
+                .any(|profile| profile.context_selection_initialized);
+        if should_sync_selection {
+            for profile in &mut settings.relay_profiles {
+                profile.context_selection = selection.clone();
+                profile.context_selection_initialized = true;
+            }
+        }
     }
     settings.codex_app_image_overlay_opacity =
         clamp_image_overlay_opacity(settings.codex_app_image_overlay_opacity);
@@ -1429,6 +1490,19 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     settings
 }
 
+fn merge_context_config_sections(current: &str, incoming: &str) -> String {
+    let current = current.trim();
+    let incoming = incoming.trim();
+    if current.is_empty() {
+        return normalize_text_config(incoming.to_string());
+    }
+    if incoming.is_empty() {
+        return normalize_text_config(current.to_string());
+    }
+    crate::relay_config::merge_common_config_into_config(incoming, current)
+        .unwrap_or_else(|_| join_config_sections(&[current, incoming]))
+}
+
 fn split_context_config_sections(config: &str) -> (String, String) {
     let mut common = Vec::new();
     let mut context = Vec::new();
@@ -1453,7 +1527,8 @@ fn split_context_config_sections(config: &str) -> (String, String) {
 }
 
 fn is_context_table_header(header: &str) -> bool {
-    header.starts_with("[mcp_servers.")
+    matches!(header, "[mcp_servers]" | "[skills]" | "[plugins]")
+        || header.starts_with("[mcp_servers.")
         || header.starts_with("[skills.")
         || header.starts_with("[plugins.")
 }
@@ -2432,6 +2507,161 @@ experimental_bearer_token = "sk-existing""#
                 .contains("[plugins.\"superpowers@openai-curated\"]")
         );
         assert_eq!(store.load().unwrap(), updated);
+    }
+
+    #[test]
+    fn settings_store_update_migrates_parent_context_tables() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let updated = store
+            .update(json!({
+                "relayProfiles": [{
+                    "id": "relay-a",
+                    "name": "供应商 A",
+                    "relayMode": "pureApi",
+                    "configContents": "model = \"gpt-5.6\"\n\n[plugins]\n\n[plugins.\"browser@openai-bundled\"]\nenabled = true\n"
+                }],
+                "activeRelayId": "relay-a"
+            }))
+            .unwrap();
+
+        assert!(
+            !updated.relay_profiles[0]
+                .config_contents
+                .contains("[plugins]")
+        );
+        assert!(updated.relay_context_config_contents.contains("[plugins]"));
+        assert!(
+            updated
+                .relay_context_config_contents
+                .contains("[plugins.\"browser@openai-bundled\"]")
+        );
+    }
+
+    #[test]
+    fn settings_store_update_migrates_profile_context_into_global_config() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+
+        let updated = store
+            .update(json!({
+                "relayProfiles": [
+                    {
+                        "id": "relay-a",
+                        "name": "供应商 A",
+                        "relayMode": "pureApi",
+                        "configContents": "model = \"gpt-5.6\"\n\n[mcp_servers.context7]\ncommand = \"npx\"\n\n[plugins.\"browser@openai-bundled\"]\nenabled = true\n",
+                        "contextSelection": {
+                            "mcpServers": [],
+                            "skills": [],
+                            "plugins": []
+                        },
+                        "contextSelectionInitialized": true
+                    }
+                ],
+                "activeRelayId": "relay-a",
+                "relayContextConfigContents": "[plugins.\"browser@openai-bundled\"]\nenabled = false\n"
+            }))
+            .unwrap();
+
+        assert!(
+            updated
+                .relay_context_config_contents
+                .contains("[mcp_servers.context7]")
+        );
+        assert!(
+            updated
+                .relay_context_config_contents
+                .contains("[plugins.\"browser@openai-bundled\"]")
+        );
+        assert!(
+            !updated.relay_profiles[0]
+                .config_contents
+                .contains("[mcp_servers.context7]")
+        );
+        assert!(
+            !updated.relay_profiles[0]
+                .config_contents
+                .contains("[plugins.\"browser@openai-bundled\"]")
+        );
+        assert!(
+            updated.relay_profiles[0]
+                .config_contents
+                .contains("model = \"gpt-5.6\"")
+        );
+        assert_eq!(
+            updated.relay_profiles[0].context_selection.mcp_servers,
+            vec!["context7"]
+        );
+        assert_eq!(
+            updated.relay_profiles[0].context_selection.plugins,
+            vec!["browser@openai-bundled"]
+        );
+        let context = parse_toml_document(&updated.relay_context_config_contents).unwrap();
+        assert_eq!(
+            context["plugins"]["browser@openai-bundled"]["enabled"].as_bool(),
+            Some(false)
+        );
+
+        let persisted: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(persisted["relayContextConfigContents"].is_string());
+        assert!(persisted["relayProfiles"][0]["configContents"].is_string());
+        assert!(persisted["relayProfiles"][0]["contextSelection"].is_object());
+        assert!(persisted["relayProfiles"][0]["contextSelectionInitialized"].is_boolean());
+
+        let first_load = store.load().unwrap();
+        let second_load = store.load().unwrap();
+        assert_eq!(first_load, second_load);
+        assert_eq!(first_load, updated);
+
+        let removed = store
+            .update(json!({ "relayContextConfigContents": "" }))
+            .unwrap();
+        assert!(removed.relay_context_config_contents.is_empty());
+        assert!(
+            removed.relay_profiles[0]
+                .context_selection
+                .plugins
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn settings_store_update_selects_global_context_for_every_profile() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+
+        let updated = store
+            .update(json!({
+                "relayProfiles": [
+                    {
+                        "id": "relay-a",
+                        "name": "供应商 A",
+                        "relayMode": "pureApi",
+                        "contextSelectionInitialized": true
+                    },
+                    {
+                        "id": "relay-b",
+                        "name": "供应商 B",
+                        "relayMode": "pureApi",
+                        "contextSelectionInitialized": true
+                    }
+                ],
+                "activeRelayId": "relay-a",
+                "relayContextConfigContents": "[skills.writer]\nenabled = true\n\n[plugins.\"browser@openai-bundled\"]\nenabled = true\n"
+            }))
+            .unwrap();
+
+        for profile in &updated.relay_profiles {
+            assert_eq!(profile.context_selection.skills, vec!["writer"]);
+            assert_eq!(
+                profile.context_selection.plugins,
+                vec!["browser@openai-bundled"]
+            );
+            assert!(profile.context_selection_initialized);
+        }
     }
 
     #[test]
