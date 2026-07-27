@@ -20,14 +20,14 @@
 
 ---
 
-### Task 1: Lock migration edge cases with failing tests
+### Task 1: Lock migration edge cases and minimally support parent tables
 
 **Files:**
 - Modify: `crates/codex-plus-core/src/settings.rs`
 
 **Interfaces:**
 - Consumes: `SettingsStore::update(Value) -> anyhow::Result<BackendSettings>`.
-- Produces: regression contracts for parent-table extraction, global conflict precedence, persistence, and idempotence.
+- Produces: regression contracts for parent-table extraction, global conflict precedence, persistence, and idempotence, with the smallest parent-header behavior fix needed to leave the task green.
 
 - [ ] **Step 1: Add a parent-table migration test**
 
@@ -68,7 +68,11 @@ Expected: FAIL because the existing table-header predicate leaves `[plugins]` in
 
 Extend the context migration test so global `enabled = false` wins a legacy profile's `enabled = true`, then call `store.load()` twice and assert both loaded settings values are equal. Read the persisted JSON only to assert context field shapes; never print it.
 
-- [ ] **Step 4: Run the focused settings suite**
+- [ ] **Step 4: Implement the minimal parent-table recognition fix**
+
+Extend `is_context_table_header` so exact `[mcp_servers]`, `[skills]`, and `[plugins]` headers are treated as context tables while retaining the existing child-table behavior. Do not extract the module in this task.
+
+- [ ] **Step 5: Run the focused settings suite and verify GREEN**
 
 Run:
 
@@ -76,7 +80,14 @@ Run:
 rtk cargo test -p codex-plus-core settings::tests
 ```
 
-Expected: the new parent-table test remains the only behavior failure before implementation.
+Expected: all settings tests pass, including the new parent-table, global precedence, persistence, deletion, and idempotence assertions.
+
+- [ ] **Step 6: Commit the tested behavior fix**
+
+```bash
+rtk git add crates/codex-plus-core/src/settings.rs
+rtk git commit -m "fix: migrate legacy context settings globally"
+```
 
 ### Task 2: Extract the context settings module and make tests green
 
