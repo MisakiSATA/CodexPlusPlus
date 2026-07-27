@@ -2626,6 +2626,7 @@ experimental_bearer_token = "sk-existing""#
                 .plugins
                 .is_empty()
         );
+        assert_eq!(store.load().unwrap(), removed);
     }
 
     #[test]
