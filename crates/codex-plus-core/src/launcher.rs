@@ -43,6 +43,31 @@ pub enum ProcessWaitStrategy {
     ExternalWaitCommand,
 }
 
+#[cfg(target_os = "linux")]
+const PROCESS_EXIT_EMPTY_OBSERVATIONS: u32 = 15;
+#[cfg(not(target_os = "linux"))]
+const PROCESS_EXIT_EMPTY_OBSERVATIONS: u32 = 3;
+
+#[derive(Debug, Default)]
+struct ProcessExitObservation {
+    empty_streak: u32,
+}
+
+impl ProcessExitObservation {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn observe(&mut self, has_codex_process: bool) -> bool {
+        if has_codex_process {
+            self.empty_streak = 0;
+            return false;
+        }
+        self.empty_streak = self.empty_streak.saturating_add(1);
+        self.empty_streak >= PROCESS_EXIT_EMPTY_OBSERVATIONS
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacosCleanupPolicy {
     QuitIfNotPreviouslyRunning,
@@ -909,15 +934,11 @@ impl LaunchHooks for DefaultLaunchHooks {
                 }
             }
         }
-        let mut empty_streak = 0u32;
+        let mut exit_observation = ProcessExitObservation::new();
         loop {
-            if crate::watcher::find_codex_processes().is_empty() {
-                empty_streak = empty_streak.saturating_add(1);
-                if empty_streak >= 3 {
-                    break;
-                }
-            } else {
-                empty_streak = 0;
+            let has_codex_process = !crate::watcher::find_codex_processes().is_empty();
+            if exit_observation.observe(has_codex_process) {
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
@@ -2964,6 +2985,17 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_launcher_tolerates_a_slow_codex_wrapper_restart() {
+        let mut wait = ProcessExitObservation::new();
+
+        for _ in 0..7 {
+            assert!(!wait.observe(false));
+        }
+        assert!(!wait.observe(true));
+    }
 
     #[test]
     fn http_body_framing_rejects_ambiguous_or_unsupported_headers() {
