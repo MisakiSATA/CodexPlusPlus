@@ -132,7 +132,9 @@ pub fn filter_killable_launcher_processes<'a>(
     processes
         .into_iter()
         .filter(|(process_id, _, exe_file)| {
-            !protected.contains(process_id) && exe_file.eq_ignore_ascii_case("codex-plus-plus.exe")
+            !protected.contains(process_id)
+                && (exe_file.eq_ignore_ascii_case("codex-plus-plus.exe")
+                    || *exe_file == "codex-plus-plus")
         })
         .map(|(process_id, _, _)| process_id)
         .collect()
@@ -151,6 +153,10 @@ pub fn process_ids_still_running(
         .into_iter()
         .filter(|process_id| expected.contains(process_id))
         .collect()
+}
+
+pub fn launcher_stop_complete(remaining_process_ids: &[u32], guard_port_listening: bool) -> bool {
+    remaining_process_ids.is_empty() && !guard_port_listening
 }
 
 #[cfg(windows)]
@@ -342,6 +348,41 @@ pub fn find_linux_codex_processes_from_proc(proc_root: &Path) -> Vec<u32> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn find_linux_launcher_processes_from_proc(
+    proc_root: &Path,
+    current_process_id: u32,
+) -> Vec<u32> {
+    let processes = std::fs::read_dir(proc_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let process_id = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let parent_process_id = linux_parent_process_id(&entry.path().join("stat"))?;
+            let executable_path = std::fs::read_link(entry.path().join("exe")).ok()?;
+            let executable_name = executable_path.file_name()?.to_str()?.to_string();
+            Some((process_id, parent_process_id, executable_name))
+        })
+        .collect::<Vec<_>>();
+    filter_killable_launcher_processes(
+        processes
+            .iter()
+            .map(|(process_id, parent_process_id, executable_name)| {
+                (*process_id, *parent_process_id, executable_name.as_str())
+            }),
+        current_process_id,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_parent_process_id(stat_path: &Path) -> Option<u32> {
+    let stat = std::fs::read_to_string(stat_path).ok()?;
+    let after_name = stat.rsplit_once(") ")?.1;
+    after_name.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
 fn linux_codex_main_process_command(command_line: &[u8]) -> bool {
     let arguments = command_line
         .split(|byte| *byte == 0)
@@ -354,12 +395,12 @@ fn linux_codex_main_process_command(command_line: &[u8]) -> bool {
     {
         return false;
     }
-    arguments.iter().any(|argument| {
-        *argument == "/usr/lib/chatgpt/ChatGPT"
-            || (!argument.starts_with("--")
+    arguments.first() == Some(&"/usr/lib/chatgpt/ChatGPT")
+        || arguments.iter().any(|argument| {
+            !argument.starts_with("--")
                 && argument.ends_with("/resources/app.asar")
-                && argument.contains("/openai-codex-desktop/"))
-    })
+                && argument.contains("/openai-codex-desktop/")
+        })
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -390,7 +431,15 @@ pub fn stop_launcher_processes() {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn stop_launcher_processes() {
+    terminate_linux_processes(&find_linux_launcher_processes_from_proc(
+        Path::new("/proc"),
+        std::process::id(),
+    ));
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn stop_launcher_processes() {}
 
 #[cfg(windows)]
@@ -413,7 +462,16 @@ pub fn stop_launcher_processes_and_wait() {
     );
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn stop_launcher_processes_and_wait() {
+    terminate_linux_launcher_processes_and_wait(
+        find_linux_launcher_processes_from_proc(Path::new("/proc"), std::process::id()),
+        RESTART_STOP_WAIT_TIMEOUT_MS,
+        RESTART_STOP_WAIT_INTERVAL_MS,
+    );
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn stop_launcher_processes_and_wait() {}
 
 #[cfg(windows)]
@@ -472,6 +530,44 @@ fn terminate_and_wait_for_exit(process_ids: Vec<u32>, timeout_ms: u64, interval_
                     "watcher.stop_wait_timeout",
                     serde_json::json!({
                         "remaining_process_ids": remaining,
+                        "timeout_ms": timeout_ms
+                    }),
+                );
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_launcher_processes_and_wait(
+    process_ids: Vec<u32>,
+    timeout_ms: u64,
+    interval_ms: u64,
+) {
+    if process_ids.is_empty() && !cdp_listening(crate::ports::launcher_guard_port()) {
+        return;
+    }
+    terminate_linux_processes(&process_ids);
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let remaining =
+            find_linux_launcher_processes_from_proc(Path::new("/proc"), std::process::id())
+                .into_iter()
+                .filter(|process_id| process_ids.contains(process_id))
+                .collect::<Vec<_>>();
+        let guard_port_listening = cdp_listening(crate::ports::launcher_guard_port());
+        if launcher_stop_complete(&remaining, guard_port_listening)
+            || std::time::Instant::now() >= deadline
+        {
+            if !launcher_stop_complete(&remaining, guard_port_listening) {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "watcher.launcher_stop_wait_timeout",
+                    serde_json::json!({
+                        "remaining_process_ids": remaining,
+                        "guard_port": crate::ports::launcher_guard_port(),
+                        "guard_port_listening": guard_port_listening,
                         "timeout_ms": timeout_ms
                     }),
                 );

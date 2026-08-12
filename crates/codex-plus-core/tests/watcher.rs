@@ -1,15 +1,18 @@
 use codex_plus_core::watcher::{
     build_spawn_launcher_command, build_watcher_install_plan, cdp_listening, codex_process_ids,
     disable_watcher_at, enable_watcher_at, filter_killable_launcher_processes,
-    process_ids_still_running, should_recover_stale_launcher, watcher_disabled_flag,
+    launcher_stop_complete, process_ids_still_running, should_recover_stale_launcher,
+    watcher_disabled_flag,
 };
 
-#[cfg(target_os = "linux")]
-use codex_plus_core::watcher::find_linux_codex_processes_from_proc;
 #[cfg(windows)]
 use codex_plus_core::watcher::{
     WindowsProcessInfo, find_codex_processes_from_snapshot,
     find_session_index_cleanup_blocking_processes_from_snapshot,
+};
+#[cfg(target_os = "linux")]
+use codex_plus_core::watcher::{
+    find_linux_codex_processes_from_proc, find_linux_launcher_processes_from_proc,
 };
 
 #[test]
@@ -78,7 +81,7 @@ fn spawn_launcher_command_points_to_silent_binary_only() {
 #[test]
 fn linux_process_scan_matches_only_the_codex_electron_main_process() {
     let proc_root = tempfile::tempdir().unwrap();
-    for process_id in [120, 121, 122, 123, 124] {
+    for process_id in [120, 121, 122, 123, 124, 125] {
         std::fs::create_dir_all(proc_root.path().join(process_id.to_string())).unwrap();
     }
     std::fs::write(
@@ -106,10 +109,46 @@ fn linux_process_scan_matches_only_the_codex_electron_main_process() {
         b"/usr/lib/electron/electron\0/opt/another-app/resources/app.asar\0",
     )
     .unwrap();
+    std::fs::write(
+        proc_root.path().join("125/cmdline"),
+        b"/usr/bin/gdb\0/usr/lib/chatgpt/ChatGPT\0",
+    )
+    .unwrap();
 
     assert_eq!(
         find_linux_codex_processes_from_proc(proc_root.path()),
         vec![120, 122]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_launcher_scan_protects_current_ancestry_and_ignores_manager() {
+    let proc_root = tempfile::tempdir().unwrap();
+    let processes = [
+        (10, 0, "codex-plus-plus"),
+        (20, 10, "codex-plus-plus"),
+        (30, 20, "codex-plus-plus-manager"),
+        (40, 10, "codex-plus-plus"),
+        (50, 10, "codex-plus-plus-manager"),
+        (60, 10, "bash"),
+    ];
+
+    for (process_id, parent_process_id, executable) in processes {
+        let process_dir = proc_root.path().join(process_id.to_string());
+        std::fs::create_dir_all(&process_dir).unwrap();
+        std::fs::write(
+            process_dir.join("stat"),
+            format!("{process_id} ({executable}) S {parent_process_id} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(format!("/opt/codex/{executable}"), process_dir.join("exe"))
+            .unwrap();
+    }
+
+    assert_eq!(
+        find_linux_launcher_processes_from_proc(proc_root.path(), 30),
+        vec![40]
     );
 }
 
@@ -181,6 +220,13 @@ fn stop_wait_tracks_only_expected_process_ids() {
         process_ids_still_running(&[10, 20, 30], [5, 20, 40, 30]),
         vec![20, 30]
     );
+}
+
+#[test]
+fn launcher_stop_wait_requires_processes_and_guard_port_to_be_gone() {
+    assert!(launcher_stop_complete(&[], false));
+    assert!(!launcher_stop_complete(&[40], false));
+    assert!(!launcher_stop_complete(&[], true));
 }
 
 #[cfg(windows)]
