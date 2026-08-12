@@ -419,76 +419,6 @@ body {
   letter-spacing: 0;
 }
 
-.jojocode-overview {
-  border-color: hsl(var(--border));
-  background: hsl(var(--card));
-}
-
-.light .jojocode-overview {
-  background: hsl(var(--card));
-}
-
-.jojocode-overview-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 16px;
-  align-items: center;
-}
-
-.jojocode-overview-main {
-  display: grid;
-  grid-template-columns: 42px minmax(0, 1fr);
-  gap: 12px;
-  align-items: center;
-}
-
-.jojocode-overview-mark {
-  display: grid;
-  place-items: center;
-  width: 42px;
-  height: 42px;
-  border: 1px solid hsl(var(--brand-accent) / 0.38);
-  border-radius: 8px;
-  background: hsl(var(--brand-accent) / 0.16);
-  color: hsl(var(--brand-accent));
-}
-
-.jojocode-overview h2 {
-  margin: 2px 0 4px;
-  font-size: 20px;
-  line-height: 1.25;
-}
-
-.jojocode-overview p {
-  margin: 0;
-  color: hsl(var(--muted-foreground));
-  line-height: 1.5;
-}
-
-.jojocode-overview-side {
-  display: grid;
-  justify-items: end;
-  gap: 10px;
-}
-
-.jojocode-model-tags {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-  max-width: 390px;
-}
-
-.jojocode-model-tags span {
-  border: 1px solid hsl(var(--brand-accent) / 0.28);
-  border-radius: 999px;
-  background: hsl(var(--background) / 0.5);
-  color: hsl(var(--foreground));
-  font-size: 12px;
-  line-height: 1;
-  padding: 6px 8px;
-}
-
 .fill {
   min-height: calc(100vh - 188px);
 }
@@ -3772,8 +3702,7 @@ select {
   padding: 18px;
 }
 
-.hero-layout h2,
-.jojocode-overview h2 {
+.hero-layout h2 {
   font-size: 19px;
   font-weight: 600;
 }
@@ -3784,19 +3713,10 @@ select {
   font-weight: 600;
 }
 
-.jojocode-overview,
 .hero-panel {
   background: hsl(var(--card));
 }
 
-.jojocode-overview-mark {
-  border-color: hsl(var(--brand-accent) / 0.28);
-  border-radius: 8px;
-  background: hsl(var(--brand-accent) / 0.1);
-  color: hsl(var(--brand-accent));
-}
-
-.jojocode-model-tags span,
 .ad-tags span,
 .script-market-tag {
   border-color: hsl(var(--border));
@@ -4214,20 +4134,11 @@ select {
     margin-inline: 16px;
   }
 
-  .jojocode-overview-layout,
-  .jojocode-overview-main,
   .ad-grid,
   .mobile-server-grid {
     grid-template-columns: 1fr;
   }
 
-  .jojocode-overview-side {
-    justify-items: start;
-  }
-
-  .jojocode-model-tags {
-    justify-content: flex-start;
-  }
 }
 
 .relay-model-row-actions {
