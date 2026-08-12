@@ -389,18 +389,28 @@ fn linux_codex_main_process_command(command_line: &[u8]) -> bool {
         .filter(|argument| !argument.is_empty())
         .filter_map(|argument| std::str::from_utf8(argument).ok())
         .collect::<Vec<_>>();
-    if arguments
+    let tokens = if arguments.len() == 1 {
+        arguments[0].split_ascii_whitespace().collect::<Vec<_>>()
+    } else {
+        arguments.clone()
+    };
+    if tokens
         .iter()
         .any(|argument| argument.starts_with("--type="))
     {
         return false;
     }
-    arguments.first() == Some(&"/usr/lib/chatgpt/ChatGPT")
-        || arguments.iter().any(|argument| {
+    tokens.first() == Some(&"/usr/lib/chatgpt/ChatGPT")
+        || (tokens.first().is_some_and(|executable| {
+            Path::new(executable)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("electron")
+        }) && tokens.iter().any(|argument| {
             !argument.starts_with("--")
                 && argument.ends_with("/resources/app.asar")
                 && argument.contains("/openai-codex-desktop/")
-        })
+        }))
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]

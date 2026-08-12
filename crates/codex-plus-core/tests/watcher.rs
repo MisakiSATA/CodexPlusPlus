@@ -81,7 +81,7 @@ fn spawn_launcher_command_points_to_silent_binary_only() {
 #[test]
 fn linux_process_scan_matches_only_the_codex_electron_main_process() {
     let proc_root = tempfile::tempdir().unwrap();
-    for process_id in [120, 121, 122, 123, 124, 125] {
+    for process_id in [120, 121, 122, 123, 124, 125, 126, 127, 128] {
         std::fs::create_dir_all(proc_root.path().join(process_id.to_string())).unwrap();
     }
     std::fs::write(
@@ -114,10 +114,25 @@ fn linux_process_scan_matches_only_the_codex_electron_main_process() {
         b"/usr/bin/gdb\0/usr/lib/chatgpt/ChatGPT\0",
     )
     .unwrap();
+    std::fs::write(
+        proc_root.path().join("126/cmdline"),
+        b"/usr/lib/chatgpt/ChatGPT --remote-debugging-port=9229 --inspect=127.0.0.1:9329\0",
+    )
+    .unwrap();
+    std::fs::write(
+        proc_root.path().join("127/cmdline"),
+        b"/usr/lib/chatgpt/ChatGPT --type=renderer --remote-debugging-port=9229\0",
+    )
+    .unwrap();
+    std::fs::write(
+        proc_root.path().join("128/cmdline"),
+        b"/usr/bin/codex\0exec\0/usr/lib/openai-codex-desktop/resources/app.asar\0",
+    )
+    .unwrap();
 
     assert_eq!(
         find_linux_codex_processes_from_proc(proc_root.path()),
-        vec![120, 122]
+        vec![120, 122, 126]
     );
 }
 
