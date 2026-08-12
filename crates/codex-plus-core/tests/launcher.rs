@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "linux")]
-use codex_plus_core::app_paths::find_linux_codex_app;
 use codex_plus_core::app_paths::{
     build_codex_executable, codex_app_version, find_latest_codex_app_dir,
     find_latest_codex_app_dir_from_roots, find_macos_codex_app, normalize_codex_app_path,
     packaged_app_user_model_id, resolve_codex_app_dir_with_saved, user_data_candidates_from,
 };
+#[cfg(target_os = "linux")]
+use codex_plus_core::app_paths::{find_linux_codex_app, find_linux_codex_app_default_from};
 use codex_plus_core::launcher::{
     CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
     browser_identity_changed, build_codex_arguments, build_codex_arguments_for_settings,
@@ -365,6 +365,35 @@ fn app_paths_normalizes_linux_aur_wrapper_executable() {
         Some(app.as_path())
     );
     assert_eq!(build_codex_executable(&app), app.join("codex"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn app_paths_prefers_current_linux_chatgpt_package_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    let current = temp.path().join("chatgpt");
+    let previous = temp.path().join("openai-codex-desktop");
+    let legacy = temp.path().join("codex-plus-plus/app");
+    for app in [&current, &previous, &legacy] {
+        std::fs::create_dir_all(app).unwrap();
+        std::fs::write(app.join("ChatGPT"), "").unwrap();
+        if app != &legacy {
+            std::fs::create_dir_all(app.join("resources")).unwrap();
+            std::fs::write(app.join("resources/app.asar"), "").unwrap();
+        }
+    }
+
+    assert_eq!(
+        find_linux_codex_app_default_from(&[current.clone(), previous.clone(), legacy.clone(),])
+            .as_deref(),
+        Some(current.as_path())
+    );
+
+    std::fs::remove_file(current.join("ChatGPT")).unwrap();
+    assert_eq!(
+        find_linux_codex_app_default_from(&[current, previous.clone(), legacy]).as_deref(),
+        Some(previous.as_path())
+    );
 }
 
 #[cfg(target_os = "linux")]

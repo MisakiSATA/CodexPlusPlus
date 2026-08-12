@@ -343,15 +343,23 @@ pub fn find_linux_codex_processes_from_proc(proc_root: &Path) -> Vec<u32> {
 
 #[cfg(target_os = "linux")]
 fn linux_codex_main_process_command(command_line: &[u8]) -> bool {
-    command_line
+    let arguments = command_line
         .split(|byte| *byte == 0)
         .filter(|argument| !argument.is_empty())
         .filter_map(|argument| std::str::from_utf8(argument).ok())
-        .any(|argument| {
-            !argument.starts_with("--")
+        .collect::<Vec<_>>();
+    if arguments
+        .iter()
+        .any(|argument| argument.starts_with("--type="))
+    {
+        return false;
+    }
+    arguments.iter().any(|argument| {
+        *argument == "/usr/lib/chatgpt/ChatGPT"
+            || (!argument.starts_with("--")
                 && argument.ends_with("/resources/app.asar")
-                && argument.contains("/openai-codex-desktop/")
-        })
+                && argument.contains("/openai-codex-desktop/"))
+    })
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]

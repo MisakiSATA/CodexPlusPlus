@@ -285,8 +285,17 @@ pub fn find_linux_codex_app(candidates: &[PathBuf]) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn find_linux_codex_app_default_from(candidates: &[PathBuf]) -> Option<PathBuf> {
+    find_linux_codex_app(candidates)
+}
+
+#[cfg(target_os = "linux")]
 pub fn find_linux_codex_app_default() -> Option<PathBuf> {
-    find_linux_codex_app(&[PathBuf::from("/usr/lib/codex-plus-plus/app")])
+    find_linux_codex_app_default_from(&[
+        PathBuf::from("/usr/lib/chatgpt"),
+        PathBuf::from("/usr/lib/openai-codex-desktop"),
+        PathBuf::from("/usr/lib/codex-plus-plus/app"),
+    ])
 }
 
 pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
@@ -393,6 +402,11 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
         // 任意普通文件不再视为应用根；仅当父目录已是合法 Codex 目录时取父路径
         let parent = path.parent()?;
         return normalize_codex_app_path(parent);
+    }
+
+    #[cfg(target_os = "linux")]
+    if linux_desktop_executable_in_dir(path).is_some() {
+        return Some(path.to_path_buf());
     }
 
     if executable_in_dir(path).is_some() {
@@ -726,6 +740,15 @@ fn linux_executable_in_dir(dir: &Path) -> Option<PathBuf> {
         .iter()
         .map(|name| dir.join(name))
         .find(|candidate| candidate.exists())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_desktop_executable_in_dir(dir: &Path) -> Option<PathBuf> {
+    dir.join("resources")
+        .join("app.asar")
+        .is_file()
+        .then(|| linux_executable_in_dir(dir))
+        .flatten()
 }
 
 fn codex_package_parts(package_name: &str) -> Option<(AppPackageSpec, &str, &str)> {

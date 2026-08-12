@@ -33,10 +33,10 @@ The existing path normalization remains the source of truth for validating
 each candidate. An explicit command-line path or valid saved path keeps its
 existing precedence.
 
-The Linux process watcher will treat a non-renderer Electron command as the
-Codex main process when its `app.asar` argument is under either
-`/openai-codex-desktop/` or `/chatgpt/`. Unrelated Electron applications and
-renderer subprocesses remain excluded.
+The Linux process watcher will retain the previous package's `app.asar`
+recognition and additionally treat `/usr/lib/chatgpt/ChatGPT` as the current
+package's main process. A command containing `--type=...` is a Chromium child
+process and remains excluded, as do unrelated Electron applications.
 
 ## Error Handling
 
@@ -48,8 +48,8 @@ symlink or package-managed file is modified.
 
 - A regression test proves that default-candidate order prefers the current
   ChatGPT layout while falling back to the previous and legacy layouts.
-- A watcher regression proves that `/usr/lib/chatgpt/resources/app.asar` is
-  recognized and its renderer subprocess is ignored.
+- A watcher regression proves that `/usr/lib/chatgpt/ChatGPT` is recognized
+  and its renderer subprocess is ignored.
 - Focused and full `codex-plus-core` tests pass.
 - Release binaries build and replace the user-level Codex++ 1.2.42 install.
 - A real launch resolves `/usr/lib/chatgpt`, starts its desktop process, opens

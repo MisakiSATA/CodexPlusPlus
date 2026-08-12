@@ -78,7 +78,7 @@ fn spawn_launcher_command_points_to_silent_binary_only() {
 #[test]
 fn linux_process_scan_matches_only_the_codex_electron_main_process() {
     let proc_root = tempfile::tempdir().unwrap();
-    for process_id in [120, 121, 122] {
+    for process_id in [120, 121, 122, 123, 124] {
         std::fs::create_dir_all(proc_root.path().join(process_id.to_string())).unwrap();
     }
     std::fs::write(
@@ -93,13 +93,23 @@ fn linux_process_scan_matches_only_the_codex_electron_main_process() {
     .unwrap();
     std::fs::write(
         proc_root.path().join("122/cmdline"),
+        b"/usr/lib/chatgpt/ChatGPT\0--enable-sandbox\0--remote-debugging-port=9229\0",
+    )
+    .unwrap();
+    std::fs::write(
+        proc_root.path().join("123/cmdline"),
+        b"/usr/lib/chatgpt/ChatGPT\0--type=renderer\0--remote-debugging-port=9229\0",
+    )
+    .unwrap();
+    std::fs::write(
+        proc_root.path().join("124/cmdline"),
         b"/usr/lib/electron/electron\0/opt/another-app/resources/app.asar\0",
     )
     .unwrap();
 
     assert_eq!(
         find_linux_codex_processes_from_proc(proc_root.path()),
-        vec![120]
+        vec![120, 122]
     );
 }
 

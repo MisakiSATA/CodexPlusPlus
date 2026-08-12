@@ -43,6 +43,10 @@ fn app_paths_prefers_current_linux_chatgpt_package_layout() {
     for app in [&current, &previous, &legacy] {
         std::fs::create_dir_all(app).unwrap();
         std::fs::write(app.join("ChatGPT"), "").unwrap();
+        if app != &legacy {
+            std::fs::create_dir_all(app.join("resources")).unwrap();
+            std::fs::write(app.join("resources/app.asar"), "").unwrap();
+        }
     }
 
     assert_eq!(
@@ -112,12 +116,12 @@ main process and PID 121 as its renderer. Add these fixtures:
 ```rust
 std::fs::write(
     proc_root.path().join("122/cmdline"),
-    b"/usr/lib/chatgpt/ChatGPT\0--enable-sandbox\0/usr/lib/chatgpt/resources/app.asar\0",
+    b"/usr/lib/chatgpt/ChatGPT\0--enable-sandbox\0--remote-debugging-port=9229\0",
 )
 .unwrap();
 std::fs::write(
     proc_root.path().join("123/cmdline"),
-    b"/usr/lib/chatgpt/ChatGPT\0--type=renderer\0--app-path=/usr/lib/chatgpt/resources/app.asar\0",
+    b"/usr/lib/chatgpt/ChatGPT\0--type=renderer\0--remote-debugging-port=9229\0",
 )
 .unwrap();
 std::fs::write(
@@ -139,14 +143,24 @@ Expected: failure because the current-layout main PID is absent.
 
 - [ ] **Step 3: Implement the minimal classifier change**
 
-Accept `app.asar` arguments containing either supported package directory and
-leave renderer filtering unchanged:
+Reject Chromium child commands first, then accept either the current packaged
+executable or the previous layout's `app.asar` argument:
 
 ```rust
-!argument.starts_with("--")
-    && argument.ends_with("/resources/app.asar")
-    && (argument.contains("/openai-codex-desktop/")
-        || argument.contains("/chatgpt/"))
+let arguments = command_line
+    .split(|byte| *byte == 0)
+    .filter(|argument| !argument.is_empty())
+    .filter_map(|argument| std::str::from_utf8(argument).ok())
+    .collect::<Vec<_>>();
+if arguments.iter().any(|argument| argument.starts_with("--type=")) {
+    return false;
+}
+arguments.iter().any(|argument| {
+    *argument == "/usr/lib/chatgpt/ChatGPT"
+        || (!argument.starts_with("--")
+            && argument.ends_with("/resources/app.asar")
+            && argument.contains("/openai-codex-desktop/"))
+})
 ```
 
 - [ ] **Step 4: Verify GREEN**
