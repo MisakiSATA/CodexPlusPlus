@@ -21,4 +21,14 @@ describe("overview source", () => {
     assert.doesNotMatch(styles, /\.jojocode-overview/);
     assert.doesNotMatch(i18n, /Codex\+\+ 官方中转站|打开 JOJO Code/);
   });
+
+  it("shows the user fork as the application repository", async () => {
+    const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+    const about = sourceSection(app, "function AboutScreen", "function SettingsScreen");
+
+    assert.match(about, /github\.com\/MisakiSATA\/CodexPlusPlus/);
+    assert.match(about, /https:\/\/github\.com\/MisakiSATA\/CodexPlusPlus/);
+    assert.match(about, /https:\/\/github\.com\/MisakiSATA\/CodexPlusPlus\/issues/);
+    assert.doesNotMatch(about, /BigPizzaV3\/CodexPlusPlus/);
+  });
 });
