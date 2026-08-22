@@ -3275,9 +3275,7 @@ experimental_bearer_token = "sk-new"
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(config.contains(
-        r#"model_catalog_json = "model-catalogs/relay-deepseek.json""#
-    ));
+    assert!(config.contains(r#"model_catalog_json = "model-catalogs/relay-deepseek.json""#));
     let catalog: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(
             temp.path()

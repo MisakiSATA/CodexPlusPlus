@@ -206,21 +206,15 @@ fn model_ui_metadata_exposes_deepseek_capabilities() {
 #[test]
 fn deepseek_metadata_yields_to_explicit_window_and_fallback() {
     let fallback_entries = collect_catalog_entries("deepseek-v4-pro", &HashMap::new(), "");
-    let fallback: serde_json::Value = serde_json::from_str(&build_model_catalog_json(
-        &fallback_entries,
-        Some(512_000),
-    ))
-    .unwrap();
+    let fallback: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&fallback_entries, Some(512_000))).unwrap();
     assert_eq!(fallback["models"][0]["context_window"], 512_000);
 
     let mut windows = HashMap::new();
     windows.insert("deepseek-v4-pro".to_string(), "200K".to_string());
     let explicit_entries = collect_catalog_entries("deepseek-v4-pro", &windows, "");
-    let explicit: serde_json::Value = serde_json::from_str(&build_model_catalog_json(
-        &explicit_entries,
-        Some(512_000),
-    ))
-    .unwrap();
+    let explicit: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&explicit_entries, Some(512_000))).unwrap();
     assert_eq!(explicit["models"][0]["context_window"], 200_000);
 }
 
