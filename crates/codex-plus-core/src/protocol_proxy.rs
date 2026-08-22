@@ -3362,7 +3362,12 @@ fn extract_reasoning_summary_text(value: &Value) -> Option<String> {
 }
 
 fn default_responses_usage() -> Value {
-    json!({ "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 })
+    json!({
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "output_tokens_details": { "reasoning_tokens": 0 }
+    })
 }
 
 fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
@@ -3466,7 +3471,13 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
         result["input_tokens_details"] = json!({ "cached_tokens": cached_tokens });
     }
     if let Some(details) = usage.get("completion_tokens_details") {
-        result["output_tokens_details"] = details.clone();
+        let mut details = details.clone();
+        if details.is_object() && details.get("reasoning_tokens").is_none() {
+            details["reasoning_tokens"] = json!(0);
+        }
+        result["output_tokens_details"] = details;
+    } else {
+        result["output_tokens_details"] = json!({ "reasoning_tokens": 0 });
     }
     if let Some(cache_read) = usage.get("cache_read_input_tokens") {
         result["cache_read_input_tokens"] = cache_read.clone();
@@ -3986,6 +3997,9 @@ fn apply_chat_reasoning_options(result: &mut Value, body: &Value, model: &str) {
         {
             result["reasoning_effort"] = json!(mapped);
         }
+        ChatReasoningStyle::Thinking if is_kimi_coding_model(model) => {
+            result["reasoning_effort"] = json!(mapped);
+        }
         _ => {}
     }
 }
@@ -4014,6 +4028,7 @@ fn infer_chat_reasoning_style(model: &str) -> ChatReasoningStyle {
     }
     if model.contains("kimi")
         || model.contains("moonshot")
+        || model.starts_with("k3")
         || model.contains("glm")
         || model.contains("zhipu")
         || model.contains("z.ai")
@@ -4056,6 +4071,12 @@ fn map_chat_reasoning_effort(effort: &str, style: ChatReasoningStyle) -> Option<
             "minimal" => Some("minimal"),
             _ => None,
         },
+        ChatReasoningStyle::Thinking => match effort.as_str() {
+            "minimal" | "low" => Some("low"),
+            "medium" | "high" => Some("high"),
+            "xhigh" | "max" => Some("max"),
+            _ => None,
+        },
         _ => match effort.as_str() {
             "minimal" => Some("minimal"),
             "low" => Some("low"),
@@ -4066,6 +4087,11 @@ fn map_chat_reasoning_effort(effort: &str, style: ChatReasoningStyle) -> Option<
             _ => None,
         },
     }
+}
+
+fn is_kimi_coding_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("k3") || model.contains("for-coding")
 }
 
 fn supports_reasoning_effort(model: &str) -> bool {

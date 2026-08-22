@@ -183,6 +183,36 @@ fn responses_request_applies_ccswitch_reasoning_dialects() {
 }
 
 #[test]
+fn responses_request_maps_kimi_coding_reasoning_effort_per_official_spec() {
+    for (effort, expected) in [
+        ("minimal", "low"),
+        ("low", "low"),
+        ("medium", "high"),
+        ("high", "high"),
+        ("xhigh", "max"),
+        ("max", "max"),
+    ] {
+        let converted = responses_to_chat_completions(json!({
+            "model": "k3-256k",
+            "reasoning": { "effort": effort },
+            "input": "hi"
+        }))
+        .unwrap();
+        assert_eq!(converted["thinking"]["type"], "enabled", "{effort}");
+        assert_eq!(converted["reasoning_effort"], expected, "{effort}");
+    }
+
+    let off = responses_to_chat_completions(json!({
+        "model": "k3-256k",
+        "reasoning": { "effort": "none" },
+        "input": "hi"
+    }))
+    .unwrap();
+    assert_eq!(off["thinking"]["type"], "disabled");
+    assert!(off.get("reasoning_effort").is_none());
+}
+
+#[test]
 fn responses_request_maps_developer_role_to_system_for_chat_upstream() {
     let converted = responses_to_chat_completions(json!({
         "model": "deepseek-chat",
@@ -912,6 +942,57 @@ fn chat_completion_response_accepts_responses_style_usage_fields() {
     assert!(converted["usage"].get("input_tokens_details").is_none());
     assert_eq!(converted["usage"]["cache_read_input_tokens"], 1);
     assert_eq!(converted["usage"]["cache_creation_input_tokens"], 4);
+}
+
+#[test]
+fn chat_completion_response_defaults_missing_reasoning_tokens_to_zero() {
+    let converted = chat_completion_to_response(json!({
+        "id": "chatcmpl_no_reasoning",
+        "created": 123,
+        "model": "k3-256k",
+        "choices": [{
+            "finish_reason": "stop",
+            "message": { "role": "assistant", "content": "done" }
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "completion_tokens_details": {}
+        }
+    }))
+    .unwrap();
+
+    assert_eq!(
+        converted["usage"]["output_tokens_details"]["reasoning_tokens"],
+        0
+    );
+}
+
+#[test]
+fn chat_sse_defaults_missing_reasoning_tokens_to_zero() {
+    let sse = chat_sse_to_responses_sse(
+        r#"data: {"id":"chatcmpl_kimi","created":123,"model":"k3-256k","choices":[{"delta":{"content":"Done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10,"completion_tokens_details":{}}}
+
+data: [DONE]
+
+"#,
+    );
+    assert!(sse.contains("event: response.completed"));
+    assert!(sse.contains("\"reasoning_tokens\":0"));
+}
+
+#[test]
+fn chat_sse_without_any_usage_still_emits_reasoning_tokens() {
+    let sse = chat_sse_to_responses_sse(
+        r#"data: {"id":"chatcmpl_plain","created":123,"model":"k3-256k","choices":[{"delta":{"content":"Done"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+    );
+    assert!(sse.contains("event: response.completed"));
+    assert!(sse.contains("\"reasoning_tokens\":0"));
 }
 
 #[test]
