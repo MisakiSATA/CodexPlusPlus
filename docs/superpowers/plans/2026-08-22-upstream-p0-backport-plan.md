@@ -35,7 +35,7 @@ Add tests that convert a Chat completion with an empty `completion_tokens_detail
 
 Run:
 ```bash
-cargo test -p codex-plus-core chat_completion_response_defaults_missing_reasoning_tokens_to_zero chat_sse_defaults_missing_reasoning_tokens_to_zero chat_sse_without_any_usage_still_emits_reasoning_tokens
+cargo test -p codex-plus-core --test protocol_proxy
 ```
 Expected: the new tests fail because the generated usage object omits `reasoning_tokens`.
 
