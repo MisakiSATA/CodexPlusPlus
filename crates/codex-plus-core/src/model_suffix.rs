@@ -144,12 +144,17 @@ const GPT56_METADATA_JSON: &str = include_str!(concat!(
     "/../../assets/gpt56-model-metadata-compat.json"
 ));
 
+const DEEPSEEK_METADATA_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/deepseek-model-metadata.json"
+));
+
 pub fn requires_bundled_metadata_catalog(slug: &str) -> bool {
-    gpt56_metadata_entry(slug).is_some()
+    gpt56_metadata_entry(slug).is_some() || deepseek_metadata_entry(slug).is_some()
 }
 
 pub fn model_ui_metadata(slug: &str) -> Option<Value> {
-    let metadata = gpt56_metadata_entry(slug)?;
+    let metadata = gpt56_metadata_entry(slug).or_else(|| deepseek_metadata_entry(slug))?;
     let levels = metadata
         .get("supported_reasoning_levels")?
         .as_array()?
@@ -218,10 +223,17 @@ pub fn build_model_catalog_json_with_template(
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            let (mut model, has_model_metadata) = template
-                .cloned()
-                .map(|template| (template, false))
-                .unwrap_or_else(|| model_template_entry(&entry.slug));
+            let (mut model, has_model_metadata, is_deepseek_metadata) = match template {
+                Some(template) => (template.clone(), false, false),
+                None => {
+                    if let Some(model) = deepseek_model_template_entry(&entry.slug) {
+                        (model, true, true)
+                    } else {
+                        let (model, has_model_metadata) = model_template_entry(&entry.slug);
+                        (model, has_model_metadata, false)
+                    }
+                }
+            };
             let metadata_window = model.get("context_window").and_then(Value::as_u64);
             let context_window = entry
                 .suffix_window
@@ -235,12 +247,16 @@ pub fn build_model_catalog_json_with_template(
             }
             model["context_window"] = json!(context_window);
             model["max_context_window"] = json!(context_window);
-            // 默认 95 会让 1M 显示为 950K，显式写 100 以显示真实窗口。
-            model["effective_context_window_percent"] = json!(100);
+            // 通用自定义模型显示完整窗口；DeepSeek 保留官方目录的 95%。
+            if !is_deepseek_metadata {
+                model["effective_context_window_percent"] = json!(100);
+            }
             model["auto_compact_token_limit"] = Value::Null;
             model["priority"] = json!(1000 + index);
             model["visibility"] = json!("list");
-            model["supported_in_api"] = json!(true);
+            if !is_deepseek_metadata {
+                model["supported_in_api"] = json!(true);
+            }
             if !has_model_metadata {
                 model["additional_speed_tiers"] = json!([]);
                 model["service_tiers"] = json!([]);
@@ -273,6 +289,17 @@ fn model_template_entry(slug: &str) -> (Value, bool) {
     )
 }
 
+fn deepseek_model_template_entry(slug: &str) -> Option<Value> {
+    let compatibility = deepseek_metadata_entry(slug)?;
+    let mut template = first_bundled_template_entry().unwrap_or_else(|| json!({}));
+    if let (Some(target), Some(source)) = (template.as_object_mut(), compatibility.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    Some(template)
+}
+
 fn bundled_template_entry(slug: &str) -> Option<Value> {
     let catalog: Value = serde_json::from_str(BUNDLED_TEMPLATE_JSON).ok()?;
     catalog
@@ -289,7 +316,15 @@ fn first_bundled_template_entry() -> Option<Value> {
 }
 
 fn gpt56_metadata_entry(slug: &str) -> Option<Value> {
-    let catalog: Value = serde_json::from_str(GPT56_METADATA_JSON).ok()?;
+    catalog_metadata_entry(GPT56_METADATA_JSON, slug)
+}
+
+fn deepseek_metadata_entry(slug: &str) -> Option<Value> {
+    catalog_metadata_entry(DEEPSEEK_METADATA_JSON, slug)
+}
+
+fn catalog_metadata_entry(catalog_json: &str, slug: &str) -> Option<Value> {
+    let catalog: Value = serde_json::from_str(catalog_json).ok()?;
     catalog
         .get("models")?
         .as_array()?

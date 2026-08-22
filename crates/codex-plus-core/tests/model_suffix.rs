@@ -156,6 +156,75 @@ fn model_ui_metadata_exposes_fast_service_tier_capability() {
 }
 
 #[test]
+fn build_catalog_json_uses_runtime_compatible_deepseek_metadata() {
+    let entries = collect_catalog_entries(
+        "deepseek-v4-flash\ndeepseek-v4-pro",
+        &HashMap::new(),
+        "deepseek-v4-flash",
+    );
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    let models = catalog["models"].as_array().unwrap();
+
+    let flash = models
+        .iter()
+        .find(|model| model["slug"] == "deepseek-v4-flash")
+        .unwrap();
+    assert_eq!(flash["context_window"], 1_048_576);
+    assert_eq!(flash["max_context_window"], 1_048_576);
+    assert_eq!(flash["effective_context_window_percent"], 95);
+    assert_eq!(flash["supported_in_api"], true);
+    assert_eq!(flash["default_reasoning_level"], "high");
+
+    let pro = models
+        .iter()
+        .find(|model| model["slug"] == "deepseek-v4-pro")
+        .unwrap();
+    assert_eq!(pro["context_window"], 1_048_576);
+    assert_eq!(pro["supported_in_api"], false);
+    let efforts = pro["supported_reasoning_levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["effort"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(efforts, vec!["low", "high", "max"]);
+}
+
+#[test]
+fn model_ui_metadata_exposes_deepseek_capabilities() {
+    let metadata = model_ui_metadata("deepseek-v4-pro").expect("DeepSeek metadata should exist");
+
+    assert_eq!(metadata["displayName"], "DeepSeek-V4-Pro");
+    assert_eq!(metadata["defaultReasoningEffort"], "high");
+    assert_eq!(
+        metadata["supportedReasoningEfforts"][0]["reasoningEffort"],
+        "low"
+    );
+}
+
+#[test]
+fn deepseek_metadata_yields_to_explicit_window_and_fallback() {
+    let fallback_entries = collect_catalog_entries("deepseek-v4-pro", &HashMap::new(), "");
+    let fallback: serde_json::Value = serde_json::from_str(&build_model_catalog_json(
+        &fallback_entries,
+        Some(512_000),
+    ))
+    .unwrap();
+    assert_eq!(fallback["models"][0]["context_window"], 512_000);
+
+    let mut windows = HashMap::new();
+    windows.insert("deepseek-v4-pro".to_string(), "200K".to_string());
+    let explicit_entries = collect_catalog_entries("deepseek-v4-pro", &windows, "");
+    let explicit: serde_json::Value = serde_json::from_str(&build_model_catalog_json(
+        &explicit_entries,
+        Some(512_000),
+    ))
+    .unwrap();
+    assert_eq!(explicit["models"][0]["context_window"], 200_000);
+}
+
+#[test]
 fn collect_entries_adopts_suffix_for_current_model_from_list() {
     // 当前 model 本身无后缀，但 model_list 中靠后位置有同名带后缀条目。
     let mut windows = HashMap::new();
