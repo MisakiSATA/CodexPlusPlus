@@ -1,0 +1,22 @@
+{
+  "models": [
+    {
+      "slug": "generic-custom-model",
+      "display_name": "Custom Model",
+      "description": "Custom model",
+      "context_window": 272000,
+      "max_context_window": 272000,
+      "effective_context_window_percent": 100,
+      "auto_compact_token_limit": null,
+      "priority": 1000,
+      "visibility": "list",
+      "supported_in_api": true,
+      "additional_speed_tiers": [],
+      "service_tiers": [],
+      "availability_nux": null,
+      "upgrade": null,
+      "input_modalities": ["text"],
+      "supports_parallel_tool_calls": true
+    }
+  ]
+}

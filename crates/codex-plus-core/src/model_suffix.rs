@@ -139,6 +139,11 @@ const BUNDLED_TEMPLATE_JSON: &str = include_str!(concat!(
     "/../../assets/codex-models.json"
 ));
 
+const GENERIC_TEMPLATE_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/generic-model-template.json"
+));
+
 const GPT56_METADATA_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/gpt56-model-metadata-compat.json"
@@ -311,7 +316,9 @@ fn bundled_template_entry(slug: &str) -> Option<Value> {
 }
 
 fn first_bundled_template_entry() -> Option<Value> {
-    let catalog: Value = serde_json::from_str(BUNDLED_TEMPLATE_JSON).ok()?;
+    // Use generic template for custom models instead of GPT-specific template
+    // This avoids forcing GPT-specific fields (like base_instructions) on non-GPT models
+    let catalog: Value = serde_json::from_str(GENERIC_TEMPLATE_JSON).ok()?;
     catalog.get("models")?.as_array()?.first().cloned()
 }
 
