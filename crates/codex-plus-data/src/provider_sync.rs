@@ -513,7 +513,45 @@ fn toml_string_value(raw: &str) -> Option<String> {
 }
 
 fn acquire_lock(path: &Path) -> std::io::Result<()> {
+    acquire_lock_with_timeout(path, 300) // 5 minutes timeout
+}
+
+fn acquire_lock_with_timeout(path: &Path, timeout_secs: u64) -> std::io::Result<()> {
     fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
+
+    // Check if lock exists and is stale
+    if path.exists() {
+        let owner_file = path.join("owner.json");
+        if let Ok(metadata) = fs::metadata(&owner_file) {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(elapsed) = modified.elapsed() {
+                    if elapsed.as_secs() > timeout_secs {
+                        // Lock is stale, try to read owner info for logging
+                        let owner_info = fs::read_to_string(&owner_file).ok();
+                        eprintln!(
+                            "[WARN] Removing stale lock (age: {}s): {:?}",
+                            elapsed.as_secs(),
+                            owner_info
+                        );
+
+                        // Try to remove stale lock
+                        if let Err(e) = fs::remove_dir_all(path) {
+                            eprintln!("[ERROR] Failed to remove stale lock: {}", e);
+                            return Err(e);
+                        }
+                    } else {
+                        // Lock is fresh, respect it
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("Lock exists and is fresh (age: {}s)", elapsed.as_secs()),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Try to create new lock
     fs::create_dir(path)?;
     fs::write(
         path.join("owner.json"),
@@ -530,11 +568,16 @@ fn release_lock(path: &Path) -> std::io::Result<()> {
 
 fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result<SessionChanges> {
     let mut collected = SessionChanges::default();
-    for path in rollout_files(home)? {
-        let text = match fs::read_to_string(&path) {
+    let mut deferred_changes = Vec::new();
+    let mut processed_thread_ids = HashSet::new();
+
+    // First pass: collect all session changes
+    let rollout_paths = rollout_files(home)?;
+    for path in &rollout_paths {
+        let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) if is_locked_io_error(&error) => {
-                collected.skipped_locked_rollout_files.push(path);
+                collected.skipped_locked_rollout_files.push(path.clone());
                 continue;
             }
             Err(error) => return Err(error.into()),
@@ -552,20 +595,108 @@ fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result
                     .or_insert(0) += 1;
             }
         }
-        let original_mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
-        collected.changes.push(SessionChange {
-            path,
+        let original_mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+
+        // Check if this is a child session with parent dependency
+        let parent_thread_id = extract_parent_thread_id_from_filename(
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+        );
+
+        let change = SessionChange {
+            path: path.clone(),
             original_text: text,
             next_text: rewrite.next_text,
             original_session_meta_lines: rewrite.original_session_meta_lines,
-            thread_id: rewrite.thread_id,
+            thread_id: rewrite.thread_id.clone(),
             cwd: rewrite.cwd,
             has_user_event,
             rewrite_needed: rewrite.rewrite_needed,
             original_mtime,
-        });
+        };
+
+        // If this session has a parent that hasn't been processed yet, defer it
+        if let Some(parent_id) = parent_thread_id {
+            if !processed_thread_ids.contains(&parent_id) {
+                deferred_changes.push(change);
+                continue;
+            }
+        }
+
+        // Mark this thread as processed
+        if let Some(ref thread_id) = change.thread_id {
+            processed_thread_ids.insert(thread_id.clone());
+        }
+        collected.changes.push(change);
     }
+
+    // Second pass: process deferred changes (with retry limit to prevent infinite loops)
+    let mut retry_count = 0;
+    const MAX_RETRIES: usize = 10;
+
+    while !deferred_changes.is_empty() && retry_count < MAX_RETRIES {
+        let mut still_deferred = Vec::new();
+        let mut progress_made = false;
+
+        for change in deferred_changes {
+            let parent_thread_id = extract_parent_thread_id_from_filename(
+                change.path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+            );
+
+            // Check if parent is now processed
+            let can_process = parent_thread_id
+                .as_ref()
+                .map(|pid| processed_thread_ids.contains(pid))
+                .unwrap_or(true);
+
+            if can_process {
+                if let Some(ref thread_id) = change.thread_id {
+                    processed_thread_ids.insert(thread_id.clone());
+                }
+                collected.changes.push(change);
+                progress_made = true;
+            } else {
+                still_deferred.push(change);
+            }
+        }
+
+        deferred_changes = still_deferred;
+        retry_count += 1;
+
+        // If no progress was made, break to avoid infinite loop
+        if !progress_made {
+            break;
+        }
+    }
+
+    // Add remaining deferred changes (parent might not exist)
+    for change in deferred_changes {
+        collected.changes.push(change);
+    }
+
     Ok(collected)
+}
+
+fn extract_parent_thread_id_from_filename(filename: &str) -> Option<String> {
+    // Format: rollout-2026-08-26T14-28-48-{PARENT_UUID}_{CHILD_UUID}.jsonl
+    // If there's an underscore, extract the first UUID (parent)
+    let stem = filename.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+
+    if stem.contains('_') {
+        // This is a child session, extract parent UUID
+        let parts: Vec<&str> = stem.split('_').collect();
+        if parts.len() >= 2 {
+            // Find the last UUID before underscore
+            let before_underscore = parts[0];
+            if before_underscore.len() >= 36 {
+                let candidate = &before_underscore[before_underscore.len() - 36..];
+                if is_valid_uuid_format(candidate) {
+                    return Some(candidate.to_string());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn rewrite_rollout_session_meta_providers(
@@ -678,19 +809,44 @@ fn collect_live_thread_ids(
 
 fn rollout_thread_id_from_filename(name: &str) -> Option<String> {
     let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
-    let bytes = stem.as_bytes();
-    if bytes.len() < 36 {
-        return None;
+
+    // Handle format: rollout-2026-08-26T14-28-48-{UUID1}_{UUID2}.jsonl
+    // Extract UUID1 (root meta ID), not UUID2 (child thread ID)
+
+    // Find all potential UUID candidates in the filename
+    // UUIDs start with "01a" pattern (ULID format) followed by hex digits
+    let mut uuid_candidates = Vec::new();
+    let chars: Vec<char> = stem.chars().collect();
+
+    for i in 0..chars.len().saturating_sub(35) {
+        let candidate = &stem[i..i + 36];
+        if is_valid_uuid_format(candidate) {
+            uuid_candidates.push(candidate.to_string());
+        }
     }
-    let candidate = &stem[stem.len() - 36..];
-    let valid = candidate
-        .chars()
-        .enumerate()
-        .all(|(index, ch)| match index {
+
+    // If we found UUIDs, return the first one (root meta ID)
+    if let Some(first_uuid) = uuid_candidates.first() {
+        return Some(first_uuid.clone());
+    }
+
+    // Fallback: extract last 36 characters (original behavior)
+    if stem.len() >= 36 {
+        let candidate = &stem[stem.len() - 36..];
+        if is_valid_uuid_format(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
+fn is_valid_uuid_format(s: &str) -> bool {
+    s.len() == 36
+        && s.chars().enumerate().all(|(index, ch)| match index {
             8 | 13 | 18 | 23 => ch == '-',
             _ => ch.is_ascii_hexdigit(),
-        });
-    valid.then(|| candidate.to_string())
+        })
 }
 
 fn sqlite_thread_ids(path: &Path) -> anyhow::Result<HashSet<String>> {
@@ -1165,11 +1321,27 @@ fn restore_session_changes(changes: &[SessionChange]) -> anyhow::Result<()> {
 
 fn restore_file_mtime(path: &Path, mtime: Option<SystemTime>) {
     let Some(mtime) = mtime else { return };
-    let Ok(file) = fs::File::options().write(true).open(path) else {
-        return;
+
+    let file = match fs::File::options().write(true).open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!(
+                "[WARN] Failed to open file for mtime restoration: {}: {}",
+                path.display(),
+                e
+            );
+            return;
+        }
     };
+
     let times = std::fs::FileTimes::new().set_modified(mtime);
-    let _ = file.set_times(times);
+    if let Err(e) = file.set_times(times) {
+        eprintln!(
+            "[WARN] Failed to restore mtime for {}: {}",
+            path.display(),
+            e
+        );
+    }
 }
 
 fn table_columns(db: &Connection, table: &str) -> anyhow::Result<HashSet<String>> {
@@ -1438,9 +1610,14 @@ fn apply_global_state_update(path: &Path) -> anyhow::Result<usize> {
             state.insert(key, value);
         }
         let text = serde_json::to_string_pretty(&Value::Object(state))?;
-        fs::write(path, &text)?;
+
+        // Use atomic write to prevent corruption
+        codex_plus_core::settings::atomic_write(path, text.as_bytes())?;
+
+        // Update backup file
         if let Some(parent) = path.parent() {
-            fs::write(parent.join(".codex-global-state.json.bak"), text)?;
+            let backup_path = parent.join(".codex-global-state.json.bak");
+            codex_plus_core::settings::atomic_write(&backup_path, text.as_bytes())?;
         }
     }
     Ok(count)
