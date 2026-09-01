@@ -1188,10 +1188,11 @@ experimental_bearer_token = "sk-new"
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(!config.contains("model_catalog_json"));
+    // After fix: custom models now generate catalog to support arbitrary model names
+    assert!(config.contains("model_catalog_json"));
     assert!(config.contains("model_context_window = 200000"));
     assert!(config.contains("model_auto_compact_token_limit = 160000"));
-    assert!(!temp.path().join("model-catalogs").exists());
+    assert!(temp.path().join("model-catalogs").exists());
 }
 
 #[test]
@@ -1300,7 +1301,9 @@ experimental_bearer_token = "sk-new"
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(!config.contains("model_catalog_json"));
+    // After fix: custom models now generate catalog, replacing previous managed catalog
+    assert!(config.contains("model_catalog_json"));
+    assert!(config.contains("model-catalogs/relay-a.json"));
 }
 
 #[test]
@@ -3201,9 +3204,10 @@ experimental_bearer_token = "sk-new"
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(!config.contains("model_catalog_json"));
+    // After fix: custom models now generate catalog to support arbitrary model names
+    assert!(config.contains("model_catalog_json"));
     assert!(config.contains("model_context_window = 200000"));
-    assert!(!temp.path().join("model-catalogs").exists());
+    assert!(temp.path().join("model-catalogs").exists());
 }
 
 #[test]
