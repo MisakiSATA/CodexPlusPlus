@@ -363,6 +363,13 @@ impl LaunchHooks for LauncherHooks {
         self.core.write_status(status).await;
     }
 
+    async fn codex_process_is_alive(
+        &self,
+        launch: &codex_plus_core::launcher::CodexLaunch,
+    ) -> bool {
+        self.core.codex_process_is_alive(launch).await
+    }
+
     async fn wait_for_codex_exit(
         &self,
         launch: &codex_plus_core::launcher::CodexLaunch,

@@ -217,7 +217,7 @@ fn relay_settings_switches_profile_and_live_files_in_one_backend_transaction() {
     assert!(!save_draft.contains("saveRelayFile"));
 
     let command_start = commands_rs
-        .find("pub fn switch_relay_profile(")
+        .find("pub async fn switch_relay_profile(")
         .expect("find manager relay switch command");
     let command_end = commands_rs[command_start..]
         .find("pub fn write_diagnostic_event(")
@@ -226,7 +226,13 @@ fn relay_settings_switches_profile_and_live_files_in_one_backend_transaction() {
     let switch_command = &commands_rs[command_start..command_end];
     assert!(switch_command.contains("request.previous_active_relay_id"));
     assert!(switch_command.contains("request.settings"));
-    assert!(switch_command.contains("switch_relay_profile_in_home("));
+    let blocking_start = switch_command
+        .find("tauri::async_runtime::spawn_blocking")
+        .expect("switch command must offload blocking work");
+    let transaction_start = switch_command
+        .find("switch_relay_profile_in_home(")
+        .expect("switch command must perform the relay transaction");
+    assert!(blocking_start < transaction_start);
     assert!(!switch_command.contains("apply_relay_profile_to_home_with_switch_rules"));
     assert!(!switch_command.contains("save_relay_file"));
 
@@ -260,6 +266,28 @@ fn relay_settings_switches_profile_and_live_files_in_one_backend_transaction() {
     assert!(app_tsx.contains("onClick={createNewAggregateProfile}"));
     assert!(app_tsx.contains("已打开聚合供应商详情"));
     assert!(!commands_rs.contains("缺少独立 auth.json"));
+}
+
+#[test]
+fn remote_plugin_repair_offloads_blocking_lock_work() {
+    let commands_rs =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
+            .expect("read manager commands.rs");
+    let command_start = commands_rs
+        .find("pub async fn repair_remote_plugin_marketplace(")
+        .expect("remote plugin repair must be an async command");
+    let command_end = commands_rs[command_start..]
+        .find("\nfn remote_plugin_marketplace_counts")
+        .map(|offset| command_start + offset)
+        .expect("find end of remote plugin repair command");
+    let command = &commands_rs[command_start..command_end];
+    let blocking_start = command
+        .find("tauri::async_runtime::spawn_blocking")
+        .expect("remote plugin repair must offload blocking work");
+    let transaction_start = command
+        .find("ensure_openai_curated_remote_marketplace_available")
+        .expect("remote plugin repair must run the marketplace transaction");
+    assert!(blocking_start < transaction_start);
 }
 
 #[test]

@@ -2514,14 +2514,275 @@ fn launch_holds_relay_switch_lock_until_non_enhanced_codex_is_ready() {
     contender.join().unwrap();
 }
 
-#[test]
-fn readiness_failure_stops_codex_and_protocol_proxy_before_releasing_relay_lock() {
+#[tokio::test]
+async fn wait_for_codex_exit_persists_stopped_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("status.json"));
+    let hooks = FakeHooks::new(Arc::new(Mutex::new(Vec::new()))).with_settings(BackendSettings {
+        enhancements_enabled: false,
+        ..BackendSettings::default()
+    });
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        status_store.load_latest().unwrap().unwrap().status,
+        "running"
+    );
+
+    handle.wait_for_codex_exit().await.unwrap();
+
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.status, "stopped");
+    assert_eq!(status.message, "Codex process exited");
+}
+
+#[tokio::test]
+async fn wait_for_codex_exit_persists_crashed_status_on_wait_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("status.json"));
+    let hooks = FakeHooks::new(Arc::new(Mutex::new(Vec::new())))
+        .with_settings(BackendSettings {
+            enhancements_enabled: false,
+            ..BackendSettings::default()
+        })
+        .with_wait_error("wait interrupted");
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    let error = handle
+        .wait_for_codex_exit()
+        .await
+        .expect_err("wait errors must be returned to the caller");
+    assert!(error.to_string().contains("wait interrupted"));
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.status, "crashed");
+    assert!(status.message.contains("wait interrupted"));
+}
+
+#[tokio::test]
+async fn older_launch_handle_does_not_overwrite_newer_launch_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("status.json"));
+    let first_hooks =
+        FakeHooks::new(Arc::new(Mutex::new(Vec::new()))).with_settings(BackendSettings {
+            enhancements_enabled: false,
+            ..BackendSettings::default()
+        });
+    let first = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir.clone()),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &first_hooks,
+    )
+    .await
+    .unwrap();
+    // Ensure the ownership timestamp differs even on filesystems/clocks with millisecond
+    // resolution; both launches intentionally use the same path and ports.
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let second_hooks =
+        FakeHooks::new(Arc::new(Mutex::new(Vec::new()))).with_settings(BackendSettings {
+            enhancements_enabled: false,
+            ..BackendSettings::default()
+        });
+    let second = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &second_hooks,
+    )
+    .await
+    .unwrap();
+    let newer_started_at = status_store.load_latest().unwrap().unwrap().started_at_ms;
+
+    first.wait_for_codex_exit().await.unwrap();
+
+    let current = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(current.status, "running");
+    assert_eq!(current.started_at_ms, newer_started_at);
+
+    second.wait_for_codex_exit().await.unwrap();
+    assert_eq!(
+        status_store.load_latest().unwrap().unwrap().status,
+        "stopped"
+    );
+}
+
+#[tokio::test]
+async fn readiness_timeout_with_successful_injection_still_checks_process_liveness() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
     let status_store = StatusStore::new(temp.path().join("status.json"));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let (hooks, termination_entered, release_termination) = FakeHooks::new(events.clone())
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(BackendSettings {
+            enhancements_enabled: true,
+            ..BackendSettings::default()
+        })
+        .with_startup_error("page readiness delayed")
+        .with_codex_exited();
+
+    let error = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .expect_err("liveness must be checked even when injection succeeds after a timeout");
+
+    assert!(
+        error
+            .to_string()
+            .contains("Codex exited before startup completed")
+    );
+    assert_eq!(
+        status_store.load_latest().unwrap().unwrap().status,
+        "failed"
+    );
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .contains(&"inject:9229:57321".to_string())
+    );
+}
+
+#[tokio::test]
+async fn readiness_failure_after_codex_exit_reports_failed_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("status.json"));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(BackendSettings {
+            enhancements_enabled: true,
+            ..BackendSettings::default()
+        })
+        .with_startup_error("page not ready")
+        .with_inject_error("bridge unavailable")
+        .with_codex_exited();
+
+    let error = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .expect_err("a dead Codex process must not be reported as running_degraded");
+
+    assert!(
+        error
+            .to_string()
+            .contains("Codex exited before startup completed")
+    );
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.status, "failed");
+    assert!(
+        status
+            .message
+            .contains("Codex exited before startup completed")
+    );
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .contains(&"terminate-codex".to_string())
+    );
+}
+
+#[tokio::test]
+async fn readiness_failure_keeps_codex_running_in_degraded_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("status.json"));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(BackendSettings {
+            // 页面就绪和可选桥接都可能失败，但底层 Codex 进程仍然健康。
+            enhancements_enabled: true,
+            ..BackendSettings::default()
+        })
+        .with_startup_error("page not ready")
+        .with_inject_error("bridge unavailable");
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .expect("a readiness timeout should degrade rather than kill Codex");
+
+    let status = status_store.load_latest().unwrap().unwrap();
+    assert_eq!(status.status, "running_degraded");
+    assert!(status.message.contains("page not ready"));
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .contains(&"terminate-codex".to_string()),
+        "readiness failures must not trigger destructive cleanup"
+    );
+
+    handle.wait_for_codex_exit().await.unwrap();
+    let events = events.lock().unwrap().clone();
+    assert!(events.contains(&"wait-codex".to_string()));
+}
+
+#[test]
+fn readiness_failure_keeps_codex_running_and_releases_relay_lock_after_degraded_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("status.json"));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let hooks = FakeHooks::new(events.clone())
         .with_settings(BackendSettings {
             enhancements_enabled: false,
             relay_profiles_enabled: true,
@@ -2534,8 +2795,7 @@ fn readiness_failure_stops_codex_and_protocol_proxy_before_releasing_relay_lock(
             active_relay_id: "chat".to_string(),
             ..BackendSettings::default()
         })
-        .with_startup_error("page not ready")
-        .with_termination_barrier();
+        .with_startup_error("page not ready");
     let contender_home = hooks.codex_home.path().to_path_buf();
     let launcher_hooks = hooks.clone();
     let launcher_status = status_store.clone();
@@ -2555,44 +2815,79 @@ fn readiness_failure_stops_codex_and_protocol_proxy_before_releasing_relay_lock(
         ))
     });
 
-    termination_entered
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .expect("launcher must enter Codex termination after readiness failure");
+    let handle = launcher
+        .join()
+        .unwrap()
+        .expect("a readiness timeout should degrade rather than kill Codex");
+    assert_eq!(
+        status_store.load_latest().unwrap().unwrap().status,
+        "running_degraded"
+    );
+
     let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
-    let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
     let contender = std::thread::spawn(move || {
-        attempting_tx.send(()).unwrap();
         let _guard = acquire_relay_switch_lock(&contender_home).unwrap();
         acquired_tx.send(()).unwrap();
     });
-    attempting_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .unwrap();
-    assert!(
-        acquired_rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err(),
-        "relay lock must remain held while the failed Codex process is being terminated"
-    );
-    release_termination.send(()).unwrap();
-    let error = launcher
-        .join()
-        .unwrap()
-        .expect_err("unconfirmed config consumption must fail the launch");
-    assert!(error.to_string().contains("page not ready"));
     acquired_rx
         .recv_timeout(std::time::Duration::from_secs(1))
-        .unwrap();
+        .expect("relay lock should be released after degraded startup");
     contender.join().unwrap();
 
+    let before_exit = events.lock().unwrap().clone();
+    assert!(before_exit.contains(&"start-helper:57321".to_string()));
+    assert!(!before_exit.contains(&"terminate-codex".to_string()));
+    assert!(!before_exit.contains(&"shutdown-helper:57321".to_string()));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(handle.wait_for_codex_exit()).unwrap();
+    let events = events.lock().unwrap().clone();
+    assert!(events.contains(&"wait-codex".to_string()));
+    assert!(events.contains(&"shutdown-helper:57321".to_string()));
+    assert!(!events.contains(&"terminate-codex".to_string()));
+}
+
+#[tokio::test]
+async fn delayed_page_readiness_releases_relay_lock_after_injection_succeeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("status.json"));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(BackendSettings {
+            enhancements_enabled: true,
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .with_startup_error("initial page wait timed out")
+        .with_relay_lock_probe_after_injection();
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: status_store.clone(),
+        },
+        &hooks,
+    )
+    .await
+    .expect("successful injection should keep Codex running");
+
+    let events = events.lock().unwrap().clone();
+    assert!(
+        events.contains(&"post-injection-relay-lock:free".to_string()),
+        "relay lock must be released before post-injection maintenance: {events:?}"
+    );
     assert_eq!(
         status_store.load_latest().unwrap().unwrap().status,
-        "failed"
+        "running"
     );
-    let events = events.lock().unwrap().clone();
-    assert!(events.contains(&"start-helper:57321".to_string()));
-    assert!(events.contains(&"shutdown-helper:57321".to_string()));
-    assert!(events.contains(&"terminate-codex".to_string()));
+    handle.wait_for_codex_exit().await.unwrap();
 }
 
 #[test]
@@ -2679,12 +2974,13 @@ async fn launch_failure_reports_codex_termination_failure() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
+    let status_parent = temp.path().join("status-parent-file");
+    std::fs::write(&status_parent, "not a directory").unwrap();
     let hooks = FakeHooks::new(Arc::new(Mutex::new(Vec::new())))
         .with_settings(BackendSettings {
             enhancements_enabled: false,
             ..BackendSettings::default()
         })
-        .with_startup_error("page not ready")
         .with_termination_error("access denied");
 
     let error = launch_and_inject_with_hooks(
@@ -2692,7 +2988,7 @@ async fn launch_failure_reports_codex_termination_failure() {
             app_dir: Some(app_dir),
             debug_port: 9229,
             helper_port: 57321,
-            status_store: StatusStore::new(temp.path().join("status.json")),
+            status_store: StatusStore::new(status_parent.join("status.json")),
         },
         &hooks,
     )
@@ -2700,7 +2996,7 @@ async fn launch_failure_reports_codex_termination_failure() {
     .expect_err("launch and termination failures must be reported");
     let message = error.to_string();
 
-    assert!(message.contains("page not ready"));
+    assert!(message.contains("failed to create directory"));
     assert!(message.contains("access denied"));
 }
 
@@ -2766,7 +3062,10 @@ struct FakeHooks {
     termination_barrier: Option<Arc<StartupBarrier>>,
     termination_error: Option<String>,
     startup_error: Option<String>,
+    wait_error: Option<String>,
     probe_relay_lock_at_injection: bool,
+    probe_relay_lock_after_injection: bool,
+    codex_exited: bool,
 }
 
 impl FakeHooks {
@@ -2792,12 +3091,24 @@ impl FakeHooks {
             termination_barrier: None,
             termination_error: None,
             startup_error: None,
+            wait_error: None,
             probe_relay_lock_at_injection: false,
+            probe_relay_lock_after_injection: false,
+            codex_exited: false,
         }
     }
 
     fn with_relay_lock_probe_at_injection(mut self) -> Self {
         self.probe_relay_lock_at_injection = true;
+        self
+    }
+
+    fn with_relay_lock_probe_after_injection(mut self) -> Self {
+        self.probe_relay_lock_after_injection = true;
+        self
+    }
+    fn with_codex_exited(mut self) -> Self {
+        self.codex_exited = true;
         self
     }
 
@@ -2875,6 +3186,11 @@ impl FakeHooks {
 
     fn with_termination_error(mut self, message: &str) -> Self {
         self.termination_error = Some(message.to_string());
+        self
+    }
+
+    fn with_wait_error(mut self, message: &str) -> Self {
+        self.wait_error = Some(message.to_string());
         self
     }
 
@@ -2988,6 +3304,18 @@ impl LaunchHooks for FakeHooks {
 
     async fn sanitize_local_storage_model_suffixes(&self, _debug_port: u16) {
         self.maintenance_event("local-storage-model-suffixes");
+        if self.probe_relay_lock_after_injection {
+            match codex_plus_core::relay_switch::acquire_relay_switch_lock_with_timeout(
+                &self.resolve_codex_home(),
+                std::time::Duration::from_millis(200),
+            ) {
+                Ok(guard) => {
+                    drop(guard);
+                    self.event("post-injection-relay-lock:free");
+                }
+                Err(_) => self.event("post-injection-relay-lock:held"),
+            }
+        }
     }
 
     async fn wait_for_codex_config_load(&self, _debug_port: u16) -> anyhow::Result<()> {
@@ -3084,8 +3412,15 @@ impl LaunchHooks for FakeHooks {
         self.event(format!("status:{status}"));
     }
 
+    async fn codex_process_is_alive(&self, _launch: &CodexLaunch) -> bool {
+        !self.codex_exited
+    }
+
     async fn wait_for_codex_exit(&self, _launch: &CodexLaunch) -> anyhow::Result<()> {
         self.event("wait-codex");
+        if let Some(message) = &self.wait_error {
+            anyhow::bail!(message.clone());
+        }
         Ok(())
     }
 

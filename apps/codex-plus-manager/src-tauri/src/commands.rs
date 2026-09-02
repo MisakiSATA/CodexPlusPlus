@@ -2418,7 +2418,35 @@ pub fn remote_plugin_marketplace_status() -> CommandResult<RemotePluginMarketpla
 }
 
 #[tauri::command]
-pub fn repair_remote_plugin_marketplace() -> CommandResult<RemotePluginMarketplacePayload> {
+pub async fn repair_remote_plugin_marketplace() -> CommandResult<RemotePluginMarketplacePayload> {
+    tauri::async_runtime::spawn_blocking(repair_remote_plugin_marketplace_blocking)
+        .await
+        .unwrap_or_else(|error| {
+            let home = codex_plus_core::codex_home::default_codex_home_dir();
+            let status =
+                codex_plus_core::plugin_marketplace::openai_curated_remote_marketplace_status(
+                    &home,
+                );
+            let (plugin_count, skill_count) =
+                remote_plugin_marketplace_counts(status.marketplace_root.as_deref());
+            failed(
+                &format!("官方远端插件缓存后台任务失败：{error}"),
+                RemotePluginMarketplacePayload {
+                    codex_home: home.to_string_lossy().to_string(),
+                    marketplace_root: status
+                        .marketplace_root
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string()),
+                    config_registered: status.config_registered,
+                    needs_repair: status.needs_repair(),
+                    plugin_count,
+                    skill_count,
+                },
+            )
+        })
+}
+
+fn repair_remote_plugin_marketplace_blocking() -> CommandResult<RemotePluginMarketplacePayload> {
     let home = codex_plus_core::codex_home::default_codex_home_dir();
     match codex_plus_core::plugin_marketplace::ensure_openai_curated_remote_marketplace_available(
         &home,
@@ -2883,7 +2911,28 @@ pub struct RelayProfileSwitchRequest {
 }
 
 #[tauri::command]
-pub fn switch_relay_profile(
+pub async fn switch_relay_profile(
+    request: RelayProfileSwitchRequest,
+) -> CommandResult<RelaySwitchPayload> {
+    // 供应商切换会读写多个文件，并可能等待跨进程 flock。Tauri 同步命令运行在
+    // WebView/UI 线程上，直接执行会在 launcher 持锁时卡死管理器；将整个事务
+    // （包括进程内互斥锁）放到阻塞工作线程，避免 UI 线程被占用。
+    tauri::async_runtime::spawn_blocking(move || switch_relay_profile_blocking(request))
+        .await
+        .unwrap_or_else(|error| {
+            let status = codex_plus_core::relay_config::default_relay_status();
+            failed(
+                &format!("供应商切换后台任务失败：{error}"),
+                relay_switch_payload(
+                    SettingsStore::default().load().unwrap_or_default(),
+                    status,
+                    None,
+                ),
+            )
+        })
+}
+
+fn switch_relay_profile_blocking(
     request: RelayProfileSwitchRequest,
 ) -> CommandResult<RelaySwitchPayload> {
     let Ok(_guard) = relay_switch_mutex().lock() else {

@@ -120,6 +120,10 @@ pub struct LaunchHandle {
     pub app_dir: PathBuf,
     pub launch: CodexLaunch,
     pub status_store: StatusStore,
+    /// Timestamp written with this launch's active status.  It acts as a lightweight
+    /// ownership token so an older handle cannot overwrite a newer launch using the
+    /// same ports and app path.
+    started_at_ms: u64,
     helper_started: bool,
     hooks: Arc<dyn LaunchHooks>,
 }
@@ -140,15 +144,59 @@ impl std::fmt::Debug for LaunchHandle {
 impl LaunchHandle {
     pub async fn wait_for_codex_exit(&self) -> anyhow::Result<()> {
         let result = self.hooks.wait_for_codex_exit(&self.launch).await;
+        self.persist_terminal_status(&result);
         if self.helper_started {
             self.hooks.shutdown_helper(self.helper_port).await;
         }
         result
     }
+
+    /// Persist the terminal state only when this handle still owns the active launch record.
+    ///
+    /// A launcher can outlive the manager window, and a later launch may replace the status
+    /// file before an older handle observes its process exit.  In that case blindly writing
+    /// `stopped` would clobber the newer launch state, so we require the record to still match
+    /// this handle and to be in one of the active states.
+    fn persist_terminal_status(&self, result: &anyhow::Result<()>) {
+        let app_dir = self.app_dir.to_string_lossy().to_string();
+        let update_result = self.status_store.update_latest_if(|current| {
+            let mut current = current?;
+            if current.started_at_ms != self.started_at_ms
+                || current.debug_port != Some(self.debug_port)
+                || current.helper_port != Some(self.helper_port)
+                || current.codex_app.as_deref() != Some(app_dir.as_str())
+                || !matches!(current.status.as_str(), "running" | "running_degraded")
+            {
+                return None;
+            }
+
+            if result.is_ok() {
+                current.status = "stopped".to_string();
+                current.message = "Codex process exited".to_string();
+            } else {
+                current.status = "crashed".to_string();
+                current.message = format!(
+                    "Codex process wait failed: {}",
+                    result.as_ref().unwrap_err()
+                );
+            }
+            Some(current)
+        });
+        if let Err(error) = update_result {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.terminal_status_persist_failed",
+                serde_json::json!({
+                    "message": error.to_string(),
+                    "debug_port": self.debug_port,
+                    "helper_port": self.helper_port
+                }),
+            );
+        }
+    }
 }
 
 /// 启动阶段注入重试的总时长上限。页面 30 秒未就绪后注入重试是延长的就绪探测，
-/// 但它可能在持有供应商切换锁的失败路径上运行，必须限时结束。
+/// 但它可能在持有供应商切换锁的页面未就绪路径上运行，必须限时结束。
 pub const STARTUP_INJECTION_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(90);
 
 #[async_trait(?Send)]
@@ -228,7 +276,7 @@ pub trait LaunchHooks: Send + Sync {
         self.inject(debug_port, helper_port).await
     }
     async fn ensure_injection(&self, debug_port: u16, helper_port: u16, app_dir: &Path) -> bool {
-        // CDP 端口一直不可达时必须限时放弃：这段循环可能在启动失败路径上
+        // CDP 端口一直不可达时必须限时放弃：这段循环可能在页面未就绪路径上
         // 持有供应商切换锁运行，无界重试会把 Manager 的切换/保存拖住几十分钟。
         let deadline = std::time::Instant::now() + STARTUP_INJECTION_RETRY_WINDOW;
         let mut attempt = 0_u32;
@@ -282,6 +330,12 @@ pub trait LaunchHooks: Send + Sync {
         Ok(())
     }
     async fn write_status(&self, status: &str);
+    /// Return whether the just-launched Codex process is known to still be alive.
+    /// Implementations should be conservative and return `true` when process state cannot
+    /// be queried reliably, so a transient inspection failure never kills a healthy app.
+    async fn codex_process_is_alive(&self, _launch: &CodexLaunch) -> bool {
+        true
+    }
     async fn wait_for_codex_exit(&self, launch: &CodexLaunch) -> anyhow::Result<()>;
     async fn shutdown_helper(&self, helper_port: u16);
     async fn terminate_codex(&self, launch: &CodexLaunch) -> anyhow::Result<()>;
@@ -355,6 +409,7 @@ where
     let status_store = options.status_store.clone();
     let mut helper_started = false;
     let mut launched = None;
+    let mut launch_started_at_ms = None;
 
     let result: anyhow::Result<LaunchHandle> = async {
         if should_apply_active_relay_profile_at_launch(&settings) {
@@ -435,12 +490,16 @@ where
             drop(relay_switch_lock.take());
         }
         let mut injection_ready = false;
-        let mut injection_degraded = false;
+        let mut startup_degraded = false;
         if settings.enhancements_enabled {
             injection_ready = hooks
                 .ensure_injection(debug_port, helper_port, &app_dir)
                 .await;
             if injection_ready {
+                // 注入成功证明 Codex 页面已可被桥接；无论前面的 readiness 探测是否
+                // 超时，供应商切换锁都不再需要保护后续非配置操作。立即释放，避免
+                // Local Storage 清理或 watchdog 启动期间阻塞 Manager 的供应商切换。
+                drop(relay_switch_lock.take());
                 // 注入成功后页面已加载，此时可以通过 CDP 清理 Electron Local Storage
                 // 中残留的带后缀模型名，避免模型选择器继续显示废弃项。
                 hooks
@@ -448,16 +507,31 @@ where
                     .await;
                 hooks.start_bridge_watchdog(debug_port, helper_port).await?;
             } else {
-                injection_degraded = true;
+                startup_degraded = true;
             }
         }
         if !page_ready && !injection_ready {
-            anyhow::bail!(
-                "Codex page did not confirm configuration load: {}",
-                page_readiness_error.as_deref().unwrap_or("page not ready")
+            // Codex 已成功启动。CDP 就绪超时仅表示可选页面增强未能确认；
+            // 若将其视为致命错误，会终止用户正在使用的 Codex，表现为无提示闪退。
+            // 保持进程运行，并显式记录降级状态。
+            startup_degraded = true;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.startup_degraded",
+                serde_json::json!({
+                    "debug_port": debug_port,
+                    "helper_port": helper_port,
+                    "page_readiness_error": page_readiness_error.as_deref(),
+                    "injection_ready": injection_ready
+                }),
             );
         }
-        if injection_degraded {
+        // A readiness timeout leaves the process state uncertain.  Check liveness before
+        // publishing an active status in that case, including when a later injection succeeds;
+        // a page that was already confirmed ready is itself sufficient evidence of liveness.
+        if (!page_ready || startup_degraded) && !hooks.codex_process_is_alive(&launch).await {
+            anyhow::bail!("Codex exited before startup completed");
+        }
+        if startup_degraded {
             let message = page_readiness_error
                 .as_deref()
                 .map(|error| format!("Codex launched; page readiness is degraded: {error}"))
@@ -473,6 +547,7 @@ where
                 &app_dir,
             );
             options.status_store.save_latest(&degraded)?;
+            launch_started_at_ms = Some(degraded.started_at_ms);
             hooks.write_status("running_degraded").await;
         } else {
             let status = launch_status(
@@ -483,6 +558,7 @@ where
                 &app_dir,
             );
             options.status_store.save_latest(&status)?;
+            launch_started_at_ms = Some(status.started_at_ms);
             hooks.write_status("running").await;
         }
         drop(relay_switch_lock.take());
@@ -493,6 +569,7 @@ where
             app_dir: app_dir.clone(),
             launch,
             status_store: status_store.clone(),
+            started_at_ms: launch_started_at_ms.context("启动状态未记录时间戳")?,
             helper_started,
             hooks: Arc::clone(&hooks),
         })
@@ -1141,6 +1218,83 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn write_status(&self, _status: &str) {}
+
+    async fn codex_process_is_alive(&self, launch: &CodexLaunch) -> bool {
+        match launch {
+            CodexLaunch::Process {
+                wait_strategy,
+                command,
+                ..
+            } => {
+                // `open -W` on macOS is an external waiter and may hand off to an already
+                // running app; query the app itself instead of trusting the waiter child.
+                if *wait_strategy == ProcessWaitStrategy::ExternalWaitCommand {
+                    #[cfg(target_os = "macos")]
+                    if let Some(app_dir) = macos_app_dir_from_open_command(command) {
+                        return is_macos_app_running(&app_dir).await.unwrap_or(true);
+                    }
+                    // On platforms without an app-state query, stay conservative.
+                    return true;
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = command;
+                let mut child = self.child.lock().await;
+                match child.as_mut() {
+                    Some(child) => match child.try_wait() {
+                        Ok(None) => true,
+                        Ok(Some(_)) => false,
+                        // A transient OS query failure must not make us terminate a healthy app.
+                        Err(_) => true,
+                    },
+                    // The child may already have been reaped by another lifecycle path.  We
+                    // cannot attribute a process-list match to this launch reliably (there may
+                    // be other Codex instances), so stay conservative and let the normal exit
+                    // waiter publish the terminal status instead of rejecting this launch.
+                    None => true,
+                }
+            }
+            CodexLaunch::PackagedActivation { process_id, .. } => {
+                #[cfg(windows)]
+                {
+                    let process = self.packaged_process.lock().await.clone();
+                    let known_process = match process {
+                        Some(WindowsPackagedProcess::Existing(handle))
+                        | Some(WindowsPackagedProcess::Unconfirmed {
+                            handle: Some(handle),
+                            ..
+                        }) => Some(handle),
+                        Some(WindowsPackagedProcess::Unconfirmed {
+                            process_id,
+                            handle: None,
+                        }) => open_windows_process_handle(process_id, false)
+                            .ok()
+                            .flatten(),
+                        None => process_id.as_ref().and_then(|process_id| {
+                            open_windows_process_handle(*process_id, false)
+                                .ok()
+                                .flatten()
+                        }),
+                    };
+                    match known_process {
+                        Some(handle) => windows_process_handle_has_exited(&handle)
+                            .map(|exited| !exited)
+                            .unwrap_or(true),
+                        // We cannot prove that an unconfirmed packaged process is gone when the
+                        // OS query itself is unavailable.  Stay conservative and let the normal
+                        // exit waiter publish the terminal status later.
+                        None => true,
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    // Packaged activation is Windows-only in production.  Keep test/custom
+                    // implementations conservative on other platforms.
+                    let _ = process_id;
+                    true
+                }
+            }
+        }
+    }
 
     async fn wait_for_codex_exit(&self, launch: &CodexLaunch) -> anyhow::Result<()> {
         match launch {

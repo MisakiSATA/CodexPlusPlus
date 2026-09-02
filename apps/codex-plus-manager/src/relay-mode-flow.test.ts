@@ -77,6 +77,16 @@ test("active relay profile cannot be deleted before switching away", async () =>
   assert.match(english, /Switch to another provider before deleting/);
 });
 
+test("crash detection treats degraded launcher status as an active launch", async () => {
+  const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+  const refreshOverview = sourceSection(app, "  const refreshOverview", "  const refreshSettings");
+
+  assert.match(
+    refreshOverview,
+    /\["running",\s*"running_degraded"\]\.includes\(prev\)/,
+  );
+});
+
 test("provider master switch accurately describes startup replay", async () => {
   const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
   const english = await readFile(new URL("./i18n-en.ts", import.meta.url), "utf8");

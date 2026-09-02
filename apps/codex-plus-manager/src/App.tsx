@@ -941,7 +941,12 @@ export function App() {
       // 崩溃检测：进程从运行状态变为停止/失败 → 弹出通知
       const prev = prevLaunchStatusRef.current;
       const current = result.latest_launch?.status;
-      if (prev && prev === "running" && current && (current === "stopped" || current === "failed" || current === "crashed")) {
+      if (
+        prev &&
+        ["running", "running_degraded"].includes(prev) &&
+        current &&
+        (current === "stopped" || current === "failed" || current === "crashed")
+      ) {
         showNotice(t("Codex 意外停止"), tf("进程状态：{0}。是否要重新启动？", [current]), "failed");
       }
       prevLaunchStatusRef.current = current ?? null;
