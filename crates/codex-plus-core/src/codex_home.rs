@@ -8,7 +8,7 @@ pub fn default_codex_home_dir() -> PathBuf {
 }
 
 fn codex_home_env_dir_is_valid(path: &PathBuf) -> bool {
-    !path.as_os_str().is_empty() && !path.to_string_lossy().trim().is_empty() && path.is_dir()
+    !path.as_os_str().is_empty() && !path.to_string_lossy().trim().is_empty()
 }
 
 fn default_user_codex_home_dir() -> PathBuf {
@@ -73,24 +73,65 @@ mod tests {
     }
 
     #[test]
-    fn default_codex_home_dir_ignores_empty_or_missing_codex_home_env() {
+    fn default_codex_home_dir_ignores_empty_codex_home_env() {
+        let _lock = CODEX_HOME_ENV_LOCK.lock().unwrap();
+        let expected = default_user_codex_home_dir();
+
+        let _guard = CodexHomeEnvGuard::set_raw("   ");
+        assert_eq!(default_codex_home_dir(), expected);
+        assert_eq!(crate::relay_config::default_codex_home_dir(), expected);
+        assert_eq!(crate::codex_sqlite::default_codex_home_dir(), expected);
+    }
+
+    #[test]
+    fn default_codex_home_dir_uses_missing_env_path_and_apply_creates_it() {
         let _lock = CODEX_HOME_ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing-codex-home");
-        let expected = default_user_codex_home_dir();
+        let _guard = CodexHomeEnvGuard::set(&missing);
 
-        {
-            let _guard = CodexHomeEnvGuard::set_raw("   ");
-            assert_eq!(default_codex_home_dir(), expected);
-            assert_eq!(crate::relay_config::default_codex_home_dir(), expected);
-            assert_eq!(crate::codex_sqlite::default_codex_home_dir(), expected);
-        }
+        assert_eq!(default_codex_home_dir(), missing);
+        assert_eq!(crate::relay_config::default_codex_home_dir(), missing);
+        assert_eq!(crate::codex_sqlite::default_codex_home_dir(), missing);
 
-        {
-            let _guard = CodexHomeEnvGuard::set(&missing);
-            assert_eq!(default_codex_home_dir(), expected);
-            assert_eq!(crate::relay_config::default_codex_home_dir(), expected);
-            assert_eq!(crate::codex_sqlite::default_codex_home_dir(), expected);
-        }
+        crate::relay_config::apply_relay_config_file_to_home(
+            &default_codex_home_dir(),
+            "model = \"claude-sonnet-4\"\n",
+        )
+        .unwrap();
+        assert!(missing.join("config.toml").is_file());
+    }
+
+    #[test]
+    fn child_inherits_authoritative_missing_codex_home_without_resolver_split() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("child-codex-home");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("codex_home::tests::inherited_codex_home_probe")
+            .env("CODEX_HOME", &missing)
+            .env("CODEX_HOME_INHERIT_PROBE", &missing)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn inherited_codex_home_probe() {
+        let Some(expected) = std::env::var_os("CODEX_HOME_INHERIT_PROBE") else {
+            return;
+        };
+        let expected = PathBuf::from(expected);
+
+        assert_eq!(
+            std::env::var_os("CODEX_HOME"),
+            Some(expected.clone().into())
+        );
+        assert_eq!(default_codex_home_dir(), expected);
     }
 }

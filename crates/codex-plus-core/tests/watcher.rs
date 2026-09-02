@@ -5,6 +5,22 @@ use codex_plus_core::watcher::{
     watcher_disabled_flag,
 };
 
+#[test]
+fn packaged_activation_baseline_is_conservative_and_path_independent() {
+    let processes = [
+        (11, "ChatGPT.exe"),
+        (12, "Codex.exe"),
+        (13, "codex.exe"),
+        (14, "notepad.exe"),
+        (11, "ChatGPT.exe"),
+    ];
+
+    assert_eq!(
+        codex_plus_core::watcher::packaged_activation_baseline_process_ids(&processes),
+        vec![11, 12, 13]
+    );
+}
+
 #[cfg(windows)]
 use codex_plus_core::watcher::{
     WindowsProcessInfo, find_codex_processes_from_snapshot,

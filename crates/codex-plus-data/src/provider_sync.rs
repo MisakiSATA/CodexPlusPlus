@@ -599,7 +599,7 @@ fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result
 
         // Check if this is a child session with parent dependency
         let parent_thread_id = extract_parent_thread_id_from_filename(
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+            path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
         );
 
         let change = SessionChange {
@@ -639,7 +639,11 @@ fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result
 
         for change in deferred_changes {
             let parent_thread_id = extract_parent_thread_id_from_filename(
-                change.path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+                change
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(""),
             );
 
             // Check if parent is now processed
@@ -985,12 +989,45 @@ pub fn apply_session_index_cleanup(
     confirmed_thread_ids: &[String],
 ) -> Result<SessionIndexCleanupResult, SessionIndexCleanupApplyError> {
     let require_stopped_app = codex_home.is_none();
-    if require_stopped_app {
-        ensure_codex_app_stopped(None)?;
-    }
     let home = codex_home
         .map(Path::to_path_buf)
         .unwrap_or_else(|| dirs_home().join(".codex"));
+    apply_session_index_cleanup_in_home_with_guard(
+        &home,
+        expected_snapshot_sha256,
+        confirmed_thread_ids,
+        require_stopped_app,
+        ensure_codex_app_stopped,
+    )
+}
+
+pub fn apply_session_index_cleanup_with_stopped_app_guard(
+    codex_home: &Path,
+    expected_snapshot_sha256: &str,
+    confirmed_thread_ids: &[String],
+) -> Result<SessionIndexCleanupResult, SessionIndexCleanupApplyError> {
+    apply_session_index_cleanup_in_home_with_guard(
+        codex_home,
+        expected_snapshot_sha256,
+        confirmed_thread_ids,
+        true,
+        ensure_codex_app_stopped,
+    )
+}
+
+fn apply_session_index_cleanup_in_home_with_guard<F>(
+    home: &Path,
+    expected_snapshot_sha256: &str,
+    confirmed_thread_ids: &[String],
+    require_stopped_app: bool,
+    ensure_stopped: F,
+) -> Result<SessionIndexCleanupResult, SessionIndexCleanupApplyError>
+where
+    F: Fn(Option<PathBuf>) -> Result<(), SessionIndexCleanupApplyError>,
+{
+    if require_stopped_app {
+        ensure_stopped(None)?;
+    }
     let lock_dir = home.join("tmp/provider-sync.lock");
     acquire_lock(&lock_dir).map_err(|error| cleanup_apply_error(error, None))?;
     let result = (|| {
@@ -1034,7 +1071,7 @@ pub fn apply_session_index_cleanup(
                 backup_dir: None,
             });
         }
-        let backup_dir = create_session_index_cleanup_backup(&home, &plan, removed_entries)?;
+        let backup_dir = create_session_index_cleanup_backup(home, &plan, removed_entries)?;
         let current_bytes = fs::read(&plan.path)
             .map_err(|error| cleanup_apply_error(error, Some(backup_dir.clone())))?;
         if current_bytes != plan.original_bytes {
@@ -1044,7 +1081,7 @@ pub fn apply_session_index_cleanup(
             ));
         }
         if require_stopped_app {
-            ensure_codex_app_stopped(Some(backup_dir.clone()))?;
+            ensure_stopped(Some(backup_dir.clone()))?;
         }
         codex_plus_core::settings::atomic_write(&plan.path, next_text.as_bytes()).map_err(
             |error| {
@@ -1056,7 +1093,7 @@ pub fn apply_session_index_cleanup(
                 )
             },
         )?;
-        let _ = prune_backups(&home);
+        let _ = prune_backups(home);
         Ok(SessionIndexCleanupResult {
             pruned_entries: removed_entries,
             backup_dir: Some(backup_dir),
@@ -1341,6 +1378,32 @@ fn restore_file_mtime(path: &Path, mtime: Option<SystemTime>) {
             path.display(),
             e
         );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_guard_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_home_cleanup_path_still_requires_the_stopped_app_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let guard_calls = std::cell::Cell::new(0usize);
+
+        let error = apply_session_index_cleanup_in_home_with_guard(
+            temp.path(),
+            "unused-snapshot",
+            &[],
+            true,
+            |backup_dir| {
+                guard_calls.set(guard_calls.get() + 1);
+                Err(cleanup_apply_error("stopped-app-guard-called", backup_dir))
+            },
+        )
+        .expect_err("the explicit-home entry must run the process guard before cleanup");
+
+        assert_eq!(guard_calls.get(), 1);
+        assert_eq!(error.message, "stopped-app-guard-called");
     }
 }
 

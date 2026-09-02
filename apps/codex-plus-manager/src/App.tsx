@@ -435,12 +435,8 @@ type ExtractRelayCommonConfigResult = CommandResult<{
 type RelaySwitchResult = CommandResult<{
   settings: BackendSettings;
   settingsPath: string;
-  user_scripts: unknown;
+  userScripts: unknown;
   relay: RelayPayload;
-}>;
-
-type SettingsBackfillResult = CommandResult<{
-  settings: BackendSettings;
 }>;
 
 type RelayProfileTestResult = CommandResult<{
@@ -1870,11 +1866,11 @@ export function App() {
     const normalized = normalizeSettings(next);
     setSettingsForm(normalized);
     const result = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
-    if (result) {
-      setSettings(result);
-      setSettingsForm(normalizeSettings(result.settings));
-      if (!silent || !isSuccessStatus(result.status)) showNotice(t("设置保存"), result.message, result.status);
-    }
+    if (!result) return false;
+    setSettings(result);
+    setSettingsForm(normalizeSettings(result.settings));
+    if (!silent || !isSuccessStatus(result.status)) showNotice(t("设置保存"), result.message, result.status);
+    return isSuccessStatus(result.status);
   };
 
   const resetSettings = async () => {
@@ -2023,20 +2019,14 @@ export function App() {
   };
 
   const applyRelayInjection = async (silent = false) => {
-    const settingsResult = await run(() => call<SettingsResult>("save_settings", { settings: settingsForm }));
-    if (settingsResult) {
-      setSettings(settingsResult);
-      setSettingsForm(normalizeSettings(settingsResult.settings));
-      if (!isSuccessStatus(settingsResult.status)) {
-        showNotice(t("设置保存"), settingsResult.message, settingsResult.status);
-        return false;
-      }
-    } else {
-      return false;
-    }
-    const result = await run(() => call<RelayResult>("apply_relay_injection"));
+    const result = await run(() => call<RelayResult>("apply_relay_injection", { settings: settingsForm }));
     if (result) {
       setRelay(result);
+      const settingsResult = await run(() => call<SettingsResult>("load_settings"));
+      if (settingsResult) {
+        setSettings(settingsResult);
+        setSettingsForm(normalizeSettings(settingsResult.settings));
+      }
       await refreshRelayFiles(true);
       if (!silent || !isSuccessStatus(result.status)) showNotice(t("官方混入 API Key"), result.message, result.status);
     }
@@ -2056,20 +2046,14 @@ export function App() {
   };
 
   const applyPureApiInjection = async (silent = false) => {
-    const settingsResult = await run(() => call<SettingsResult>("save_settings", { settings: settingsForm }));
-    if (settingsResult) {
-      setSettings(settingsResult);
-      setSettingsForm(normalizeSettings(settingsResult.settings));
-      if (!isSuccessStatus(settingsResult.status)) {
-        showNotice(t("设置保存"), settingsResult.message, settingsResult.status);
-        return false;
-      }
-    } else {
-      return false;
-    }
-    const result = await run(() => call<RelayResult>("apply_pure_api_injection"));
+    const result = await run(() => call<RelayResult>("apply_pure_api_injection", { settings: settingsForm }));
     if (result) {
       setRelay(result);
+      const settingsResult = await run(() => call<SettingsResult>("load_settings"));
+      if (settingsResult) {
+        setSettings(settingsResult);
+        setSettingsForm(normalizeSettings(settingsResult.settings));
+      }
       await refreshRelayFiles(true);
       if (!silent || !isSuccessStatus(result.status)) showNotice(t("纯 API 模式"), result.message, result.status);
     }
@@ -2166,28 +2150,44 @@ export function App() {
   };
 
   const switchOfficialMode = async () => {
-    const switched = await clearRelayInjection(true);
+    const current = activeRelayProfile(settingsForm);
+    const official = current.relayMode === "official" && !current.officialMixApiKey
+      ? current
+      : settingsForm.relayProfiles.find((profile) => profile.relayMode === "official" && !profile.officialMixApiKey);
+    if (!official) {
+      showNotice(t("官方登录模式"), t("请先添加一个未混入 API Key 的官方供应商配置。"), "failed");
+      return;
+    }
+    const next = syncLegacyRelayFields({ ...settingsForm, activeRelayId: official.id, launchMode: "relay" });
+    const switched = await switchRelayProfile(next, settingsForm.activeRelayId);
     if (!switched) return;
-    const result = await saveLaunchMode("relay", true);
-    if (result) showNotice(t("官方登录模式"), t("已切回官方登录；Codex增强已设为兼容增强。"), result.status);
+    showNotice(t("官方登录模式"), t("已切回官方登录；Codex增强已设为兼容增强。"), "ok");
   };
 
   const switchPureApiMode = async () => {
-    const switched = await applyPureApiInjection(true);
+    const current = activeRelayProfile(settingsForm);
+    const pureApi = current.relayMode === "pureApi"
+      ? current
+      : settingsForm.relayProfiles.find((profile) => profile.relayMode === "pureApi");
+    if (!pureApi) {
+      showNotice(t("纯 API 模式"), t("请先添加一个纯 API 供应商配置。"), "failed");
+      return;
+    }
+    const next = syncLegacyRelayFields({ ...settingsForm, activeRelayId: pureApi.id, launchMode: "patch" });
+    const switched = await switchRelayProfile(next, settingsForm.activeRelayId);
     if (!switched) return;
-    const result = await saveLaunchMode("patch", true);
-    if (result) showNotice(t("纯 API 模式"), t("已切换到纯 API；Codex增强已设为完整增强。"), result.status);
+    showNotice(t("纯 API 模式"), t("已切换到纯 API；Codex增强已设为完整增强。"), "ok");
   };
 
   const switchRelayProfile = async (next: BackendSettings, previousActiveRelayId = settingsForm.activeRelayId) => {
     if (relaySwitching) {
       showNotice(t("供应商切换中"), t("上一次切换还没有完成，请稍后再试。"), "failed");
-      return;
+      return false;
     }
     let switchSettings = normalizeSettings(next);
     if (!switchSettings.relayProfilesEnabled) {
       showNotice(t("供应商配置已关闭"), t("当前不会写入 Codex config.toml / auth.json。打开供应商配置总开关后再切换。"), "failed");
-      return;
+      return false;
     }
     const targetBeforeSnapshot = activeRelayProfile(switchSettings);
     logDiagnostic("switchRelayProfile.start", {
@@ -2205,9 +2205,8 @@ export function App() {
         error: validationError,
       });
       showNotice(t("供应商配置可能不正确"), validationError, "failed");
-      return;
+      return false;
     }
-    switchSettings = await snapshotActiveRelayFilesBeforeSwitch(switchSettings, previousActiveRelayId);
     const selectedAfterSave = activeRelayProfile(switchSettings);
     const command = relayProfileSwitchCommand(selectedAfterSave);
 
@@ -2228,7 +2227,7 @@ export function App() {
         logDiagnostic("switchRelayProfile.apply_no_result", {
           targetRelayId: selectedAfterSave.id,
         });
-        return;
+        return false;
       }
       const selectedSettings = normalizeSettings(result.settings);
       setSettings({
@@ -2236,7 +2235,7 @@ export function App() {
         message: result.message,
         settings: selectedSettings,
         settings_path: result.settingsPath,
-        user_scripts: result.user_scripts as UserScriptInventory,
+        user_scripts: result.userScripts as UserScriptInventory,
       });
       setSettingsForm(selectedSettings);
       setRelay({
@@ -2253,7 +2252,7 @@ export function App() {
           activeRelayId: selectedSettings.activeRelayId,
         });
         showNotice(t("供应商切换"), result.message, result.status);
-        return;
+        return false;
       }
       const currentSelected = activeRelayProfile(selectedSettings);
       logDiagnostic("switchRelayProfile.ok", {
@@ -2261,29 +2260,10 @@ export function App() {
         launchMode: selectedSettings.launchMode,
         status: result.status,
       });
+      return true;
     } finally {
       setRelaySwitching(false);
     }
-  };
-
-  const snapshotActiveRelayFilesBeforeSwitch = async (
-    next: BackendSettings,
-    previousActiveRelayId: string,
-  ): Promise<BackendSettings> => {
-    const profileId = previousActiveRelayId.trim();
-    if (!profileId) return next;
-    const result = await run(() =>
-      call<SettingsBackfillResult>("backfill_relay_profile_from_live", {
-        request: { settings: next, profileId },
-      }),
-    );
-    if (!result) return next;
-    const normalized = normalizeSettings(result.settings);
-    if (!isSuccessStatus(result.status)) {
-      showNotice(t("供应商切换"), result.message, result.status);
-      return next;
-    }
-    return normalized;
   };
 
   const copyText = async (text: string, message: string) => {
@@ -2899,7 +2879,7 @@ type Actions = {
   checkUpdate: () => Promise<void>;
   performUpdate: () => Promise<void>;
   saveSettings: () => Promise<void>;
-  saveSettingsValue: (settings: BackendSettings, silent?: boolean) => Promise<void>;
+  saveSettingsValue: (settings: BackendSettings, silent?: boolean) => Promise<boolean>;
   refreshSettings: (silent?: boolean) => Promise<BackendSettings | null>;
   resetSettings: () => Promise<void>;
   resetImageOverlaySettings: () => Promise<void>;
@@ -2964,7 +2944,7 @@ type Actions = {
   diagnoseRelayProfile: (profile: RelayProfile) => Promise<ProviderDoctorResult | null>;
   testStepwiseSettings: (settings: BackendSettings) => Promise<void>;
   fetchRelayProfileModels: (profile: RelayProfile) => Promise<string[] | null>;
-  switchRelayProfile: (settings: BackendSettings, previousActiveRelayId?: string) => Promise<void>;
+  switchRelayProfile: (settings: BackendSettings, previousActiveRelayId?: string) => Promise<boolean>;
   relaySwitching: boolean;
   switchOfficialMode: () => Promise<void>;
   switchPureApiMode: () => Promise<void>;
@@ -3154,7 +3134,7 @@ function RelayScreen({
   const isNewProfile = !!newProfileDraft;
   const saveRelaySettings = async (next: BackendSettings) => {
     onFormChange(next);
-    await actions.saveSettingsValue(next, true);
+    return actions.saveSettingsValue(next, true);
   };
   const createNewAggregateProfile = () => {
     const draft = createAggregateRelayProfile(normalized);
@@ -3227,7 +3207,7 @@ function RelayScreen({
             />
             <span>
               <strong>{t("启用供应商配置切换")}</strong>
-              <small>{t("关闭后本工具不会在手动切换时写入 Codex 的 config.toml / auth.json；启动 Codex 时始终不会自动改这些文件。")}</small>
+              <small>{t("关闭后，手动切换和启动 Codex 都不会写入 config.toml / auth.json；开启后，通过 Codex++ 启动时会重新应用当前 API 或聚合供应商，纯官方登录配置除外。")}</small>
             </span>
             <ToggleVisual />
           </label>
@@ -5243,13 +5223,14 @@ function SortableRelayProfileCard({
             <Copy className="h-4 w-4" />
           </Button>
           <Button
-            disabled={form.relayProfiles.length <= 1}
+            disabled={form.relayProfiles.length <= 1 || active}
             onClick={(event) => {
               event.stopPropagation();
+              if (active) return;
               onFormChange(removeRelayProfile(form, profile.id));
             }}
             size="icon"
-            title={t("删除供应商")}
+            title={active ? t("当前供应商使用中，请先切换到其他供应商再删除") : t("删除供应商")}
             variant="ghost"
           >
             <Trash2 className="h-4 w-4" />
@@ -5327,7 +5308,7 @@ function RelayProfileDetail({
   form: BackendSettings;
   isNew?: boolean;
   onBack: () => void;
-  onFormChange: (value: BackendSettings) => void | Promise<void>;
+  onFormChange: (value: BackendSettings) => Promise<boolean>;
   onSaved?: () => void;
   actions: Actions;
 }) {
@@ -5364,15 +5345,10 @@ function RelayProfileDetail({
     const next = isNew
       ? addRelayProfile(form, normalizedDraft)
       : updateRelayProfile(form, profile.id, normalizedDraft);
-    await onFormChange(next);
-    if (isActive && relayProfileUsesLiveFiles(normalizedDraft)) {
-      await actions.saveRelayFile(
-        "config",
-        effectiveRelayConfigPreview(normalizedDraft, form, normalizedDraft),
-        true,
-      );
-      await actions.saveRelayFile("auth", normalizedDraft.authContents, true);
-    }
+    const saved = isActive && form.relayProfilesEnabled
+      ? await actions.switchRelayProfile(next, form.activeRelayId)
+      : await onFormChange(next);
+    if (!saved) return;
     onSaved?.();
   };
   const switchDraft = () => {

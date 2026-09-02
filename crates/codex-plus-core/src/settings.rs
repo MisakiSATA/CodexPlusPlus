@@ -660,8 +660,16 @@ impl BackendSettings {
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
-        self.active_aggregate_relay_profile().is_some()
-            || self.active_relay_profile().protocol == RelayProtocol::ChatCompletions
+        if !self.relay_profiles_enabled {
+            return false;
+        }
+        if self.active_aggregate_relay_profile().is_some() {
+            return true;
+        }
+        let active_relay = self.active_relay_profile();
+        let official_without_api =
+            active_relay.relay_mode == RelayMode::Official && !active_relay.official_mix_api_key;
+        !official_without_api && active_relay.protocol == RelayProtocol::ChatCompletions
     }
 }
 
@@ -994,6 +1002,70 @@ impl SettingsStore {
             Value::String(settings.relay_context_config_contents.clone()),
         );
         context::persist_profile_fields(&mut raw, &settings.relay_profiles);
+        let bytes = serde_json::to_vec_pretty(&Value::Object(raw))?;
+        atomic_write(&self.path, &bytes)?;
+        Ok(settings)
+    }
+
+    pub(crate) fn update_reconciled_relay_profile(
+        &self,
+        profile: &RelayProfile,
+        relay_context_config_contents: &str,
+    ) -> anyhow::Result<BackendSettings> {
+        let mut profile = profile.clone();
+        crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
+        let Value::Object(profile_update) = serde_json::to_value(&profile)? else {
+            anyhow::bail!("供应商配置序列化结果无效");
+        };
+
+        let mut raw = self.load_raw_object()?;
+        let current_active_relay_id = raw
+            .get("activeRelayId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if current_active_relay_id != profile.id {
+            anyhow::bail!(
+                "供应商回填请求已过期：当前供应商已从「{}」变为「{}」。",
+                profile.id,
+                current_active_relay_id
+            );
+        }
+        {
+            let profiles = raw
+                .get_mut("relayProfiles")
+                .and_then(Value::as_array_mut)
+                .with_context(|| "供应商配置列表缺失")?;
+            let stored_profile = profiles
+                .iter_mut()
+                .find(|stored| stored.get("id").and_then(Value::as_str) == Some(&profile.id))
+                .with_context(|| "当前供应商已不在配置列表中")?;
+            let stored_profile = stored_profile
+                .as_object_mut()
+                .with_context(|| "当前供应商配置格式无效")?;
+            for derived_field in ["model", "baseUrl", "apiKey"] {
+                stored_profile.remove(derived_field);
+            }
+            for (key, value) in profile_update {
+                stored_profile.insert(key, value);
+            }
+        }
+        raw.insert(
+            "relayContextConfigContents".to_string(),
+            Value::String(relay_context_config_contents.to_string()),
+        );
+
+        let settings = normalize_settings_config_sections(
+            serde_json::from_value(Value::Object(raw.clone())).unwrap_or_default(),
+        );
+        raw.insert(
+            "relayCommonConfigContents".to_string(),
+            Value::String(settings.relay_common_config_contents.clone()),
+        );
+        raw.insert(
+            "relayContextConfigContents".to_string(),
+            Value::String(settings.relay_context_config_contents.clone()),
+        );
+        context::persist_profile_fields_for_id(&mut raw, &settings.relay_profiles, &profile.id);
         let bytes = serde_json::to_vec_pretty(&Value::Object(raw))?;
         atomic_write(&self.path, &bytes)?;
         Ok(settings)
@@ -2112,6 +2184,123 @@ experimental_bearer_token = "sk-existing""#
             ]
         );
         assert_eq!(store.load().unwrap(), updated);
+    }
+
+    #[test]
+    fn reconciled_profile_update_only_replaces_active_known_fields() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        let inactive_profile = json!({
+            "id": "inactive",
+            "name": "Inactive",
+            "inactiveCustomField": { "keep": true },
+            "contextSelection": {
+                "mcpServers": ["inactive"],
+                "skills": [],
+                "plugins": []
+            },
+            "contextSelectionInitialized": true
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "activeRelayId": "active",
+                "relayProfiles": [{
+                    "id": "active",
+                    "name": "Stale",
+                    "model": "stale-model",
+                    "baseUrl": "https://stale.example/v1",
+                    "apiKey": "sk-stale",
+                    "protocol": "chatCompletions",
+                    "relayMode": "pureApi",
+                    "activeCustomField": { "keep": true },
+                    "contextSelection": {
+                        "mcpServers": ["live"],
+                        "skills": [],
+                        "plugins": []
+                    },
+                    "contextSelectionInitialized": true
+                }, inactive_profile.clone()],
+                "relayContextConfigContents": "",
+                "customTopLevelField": { "keep": true }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let reconciled = RelayProfile {
+            id: "active".to_string(),
+            name: "Reconciled".to_string(),
+            upstream_base_url: "https://live.example/v1".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            relay_mode: RelayMode::PureApi,
+            config_contents: "model = \"live-model\"\n".to_string(),
+            auth_contents: r#"{"OPENAI_API_KEY":"sk-live"}"#.to_string(),
+            context_selection: RelayContextSelection {
+                mcp_servers: vec!["live".to_string()],
+                ..RelayContextSelection::default()
+            },
+            context_selection_initialized: true,
+            ..RelayProfile::default()
+        };
+        let context = "[mcp_servers.live]\ncommand = \"live\"\n";
+
+        let updated = store
+            .update_reconciled_relay_profile(&reconciled, context)
+            .unwrap();
+        assert_eq!(updated.active_relay_profile().name, "Reconciled");
+        assert_eq!(
+            updated.active_relay_profile().upstream_base_url,
+            "https://live.example/v1"
+        );
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let active = &saved["relayProfiles"][0];
+        assert_eq!(active["name"], "Reconciled");
+        assert_eq!(active["upstreamBaseUrl"], "https://live.example/v1");
+        assert_eq!(active["activeCustomField"], json!({ "keep": true }));
+        assert!(active.get("model").is_none());
+        assert!(active.get("baseUrl").is_none());
+        assert!(active.get("apiKey").is_none());
+        assert_eq!(saved["relayProfiles"][1], inactive_profile);
+        assert_eq!(saved["customTopLevelField"], json!({ "keep": true }));
+        assert_eq!(saved["relayContextConfigContents"], context);
+    }
+
+    #[test]
+    fn official_mix_chat_profile_uses_protocol_proxy() {
+        let settings = BackendSettings {
+            relay_profiles_enabled: true,
+            relay_profiles: vec![RelayProfile {
+                id: "official-mix".to_string(),
+                relay_mode: RelayMode::Official,
+                official_mix_api_key: true,
+                protocol: RelayProtocol::ChatCompletions,
+                ..RelayProfile::default()
+            }],
+            active_relay_id: "official-mix".to_string(),
+            ..BackendSettings::default()
+        };
+
+        assert!(settings.active_relay_uses_protocol_proxy());
+    }
+
+    #[test]
+    fn disabled_relay_profiles_never_use_protocol_proxy() {
+        let settings = BackendSettings {
+            relay_profiles_enabled: false,
+            relay_profiles: vec![RelayProfile {
+                id: "chat".to_string(),
+                relay_mode: RelayMode::PureApi,
+                protocol: RelayProtocol::ChatCompletions,
+                ..RelayProfile::default()
+            }],
+            active_relay_id: "chat".to_string(),
+            ..BackendSettings::default()
+        };
+
+        assert!(!settings.active_relay_uses_protocol_proxy());
     }
 
     #[test]

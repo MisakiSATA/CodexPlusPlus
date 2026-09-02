@@ -953,6 +953,7 @@ async fn launch_lifecycle_uses_hook_supplied_bridge_context_for_injection() {
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
     let hooks = ContextHooks {
         events: events.clone(),
+        codex_home: temp.path().join("codex-home"),
     };
 
     launch_and_inject_with_hooks(
@@ -1350,6 +1351,7 @@ impl BridgeDataService for FakeData {
 #[derive(Clone)]
 struct ContextHooks {
     events: Arc<Mutex<Vec<String>>>,
+    codex_home: std::path::PathBuf,
 }
 
 impl ContextHooks {
@@ -1360,6 +1362,10 @@ impl ContextHooks {
 
 #[async_trait(?Send)]
 impl LaunchHooks for ContextHooks {
+    fn resolve_codex_home(&self) -> std::path::PathBuf {
+        self.codex_home.clone()
+    }
+
     fn resolve_app_dir(
         &self,
         app_dir: Option<&std::path::Path>,
@@ -1382,7 +1388,24 @@ impl LaunchHooks for ContextHooks {
         Ok(BackendSettings::default())
     }
 
-    async fn run_provider_sync(&self) -> anyhow::Result<()> {
+    async fn run_provider_sync(&self, _codex_home: &std::path::Path) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn sync_dream_skin_base_theme(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn sanitize_historical_model_suffixes(
+        &self,
+        _codex_home: &std::path::Path,
+    ) -> anyhow::Result<codex_plus_core::codex_sqlite::SanitizeModelSuffixResult> {
+        Ok(Default::default())
+    }
+
+    async fn sanitize_local_storage_model_suffixes(&self, _debug_port: u16) {}
+
+    async fn wait_for_codex_config_load(&self, _debug_port: u16) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1442,5 +1465,7 @@ impl LaunchHooks for ContextHooks {
 
     async fn shutdown_helper(&self, _helper_port: u16) {}
 
-    async fn terminate_codex(&self, _launch: &CodexLaunch) {}
+    async fn terminate_codex(&self, _launch: &CodexLaunch) -> anyhow::Result<()> {
+        Ok(())
+    }
 }

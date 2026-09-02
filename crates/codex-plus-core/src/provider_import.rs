@@ -58,6 +58,8 @@ pub fn confirm_pending_provider_import() -> anyhow::Result<Option<ProviderImport
     if !path.exists() {
         return Ok(None);
     }
+    let home = crate::relay_config::default_codex_home_dir();
+    let _relay_switch_lock = crate::relay_switch::acquire_relay_switch_lock(&home)?;
     confirm_pending_provider_import_at(&path, SettingsStore::default()).map(Some)
 }
 
@@ -105,6 +107,8 @@ pub fn confirm_pending_provider_import_at(
 }
 
 pub fn import_provider(request: ProviderImportRequest) -> anyhow::Result<ProviderImportResult> {
+    let home = crate::relay_config::default_codex_home_dir();
+    let _relay_switch_lock = crate::relay_switch::acquire_relay_switch_lock(&home)?;
     import_provider_with_store(request, SettingsStore::default())
 }
 

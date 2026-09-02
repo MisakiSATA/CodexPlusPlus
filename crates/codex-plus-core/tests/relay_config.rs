@@ -11,7 +11,7 @@ use codex_plus_core::relay_config::{
     list_context_entries_from_common_config, normalize_relay_profile_for_storage,
     relay_config_status_from_home, sanitize_common_config_contents,
     set_codex_goals_feature_in_home, strip_common_config_from_config,
-    sync_live_config_context_entries, upsert_context_entry_in_common_config,
+    sync_live_config_context_entries, test_relay_profile, upsert_context_entry_in_common_config,
 };
 use codex_plus_core::settings::{RelayContextSelection, RelayMode, RelayProfile, RelayProtocol};
 
@@ -39,6 +39,197 @@ fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {
         r#"{"name":"product-design"}"#,
     )
     .unwrap();
+}
+
+async fn spawn_relay_test_server(
+    responses: Vec<String>,
+) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for response in responses {
+            let accepted =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                    .await;
+            let Ok(Ok((mut stream, _))) = accepted else {
+                break;
+            };
+            let mut buffer = vec![0_u8; 8192];
+            let size = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            requests.push(request.lines().next().unwrap_or_default().to_string());
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+        requests
+    });
+    (format!("http://{address}"), task)
+}
+
+fn relay_test_http_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn relay_test_profile(base_url: String, protocol: RelayProtocol) -> RelayProfile {
+    RelayProfile {
+        base_url,
+        protocol,
+        relay_mode: RelayMode::PureApi,
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test"}"#.to_string(),
+        ..RelayProfile::default()
+    }
+}
+
+#[tokio::test]
+async fn relay_connection_test_uses_runtime_endpoint_for_origin_only_url() {
+    let (base_url, server) = spawn_relay_test_server(vec![relay_test_http_response(
+        "200 OK",
+        r#"{"id":"resp_1","object":"response","status":"completed","error":null,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}]}"#,
+    )])
+    .await;
+    let profile = relay_test_profile(base_url.clone(), RelayProtocol::Responses);
+
+    let result = test_relay_profile(&profile, "claude-sonnet-4")
+        .await
+        .unwrap();
+    let requests = server.await.unwrap();
+
+    assert_eq!(result.endpoint, format!("{base_url}/responses"));
+    assert_eq!(requests, vec!["POST /responses HTTP/1.1"]);
+    assert_eq!(result.http_status, 200);
+}
+
+#[tokio::test]
+async fn relay_connection_test_does_not_false_green_on_non_runtime_v1_fallback() {
+    let (origin, server) = spawn_relay_test_server(vec![
+        relay_test_http_response("404 Not Found", r#"{"error":"missing"}"#),
+        relay_test_http_response("200 OK", r#"{"ok":true}"#),
+    ])
+    .await;
+    let base_url = format!("{origin}/openai");
+    let profile = relay_test_profile(base_url.clone(), RelayProtocol::ChatCompletions);
+
+    let result = test_relay_profile(&profile, "grok-4").await.unwrap();
+    let requests = server.await.unwrap();
+
+    assert_eq!(result.endpoint, format!("{base_url}/chat/completions"));
+    assert_eq!(result.http_status, 404);
+    assert_eq!(requests, vec!["POST /openai/chat/completions HTTP/1.1"]);
+}
+
+#[tokio::test]
+async fn relay_connection_test_rejects_non_json_success_response() {
+    let (base_url, server) =
+        spawn_relay_test_server(vec![relay_test_http_response("200 OK", "not json")]).await;
+    let profile = relay_test_profile(base_url, RelayProtocol::Responses);
+
+    let error = test_relay_profile(&profile, "claude-sonnet-4")
+        .await
+        .expect_err("2xx response must contain parseable JSON");
+    server.await.unwrap();
+
+    assert!(error.to_string().contains("JSON"));
+}
+
+#[tokio::test]
+async fn relay_connection_test_rejects_top_level_error_in_success_response() {
+    let (base_url, server) = spawn_relay_test_server(vec![relay_test_http_response(
+        "200 OK",
+        r#"{"error":{"message":"unsupported model"}}"#,
+    )])
+    .await;
+    let profile = relay_test_profile(base_url, RelayProtocol::Responses);
+
+    let error = test_relay_profile(&profile, "claude-sonnet-4")
+        .await
+        .expect_err("2xx top-level error must not be reported as success");
+    server.await.unwrap();
+
+    assert!(error.to_string().contains("error"));
+}
+
+#[tokio::test]
+async fn relay_connection_test_rejects_empty_object_success_response() {
+    let (base_url, server) =
+        spawn_relay_test_server(vec![relay_test_http_response("200 OK", "{}")]).await;
+    let profile = relay_test_profile(base_url, RelayProtocol::Responses);
+
+    let error = test_relay_profile(&profile, "claude-sonnet-4")
+        .await
+        .expect_err("2xx empty object lacks Responses output and must fail");
+    server.await.unwrap();
+
+    assert!(error.to_string().contains("output"));
+}
+
+#[tokio::test]
+async fn relay_connection_test_rejects_ok_wrapper_success_response() {
+    let (base_url, server) =
+        spawn_relay_test_server(vec![relay_test_http_response("200 OK", r#"{"ok":true}"#)]).await;
+    let profile = relay_test_profile(base_url, RelayProtocol::Responses);
+
+    let error = test_relay_profile(&profile, "claude-sonnet-4")
+        .await
+        .expect_err("2xx ok-wrapper body is not a Responses payload and must fail");
+    server.await.unwrap();
+
+    assert!(error.to_string().contains("output"));
+}
+
+#[tokio::test]
+async fn relay_connection_test_rejects_success_false_wrapper_for_chat_completions() {
+    let (base_url, server) = spawn_relay_test_server(vec![relay_test_http_response(
+        "200 OK",
+        r#"{"success":false}"#,
+    )])
+    .await;
+    let profile = relay_test_profile(base_url, RelayProtocol::ChatCompletions);
+
+    let error = test_relay_profile(&profile, "grok-4")
+        .await
+        .expect_err("2xx success:false wrapper lacks choices and must fail");
+    server.await.unwrap();
+
+    assert!(error.to_string().contains("choices"));
+}
+
+#[tokio::test]
+async fn relay_connection_test_rejects_chat_completions_without_choices() {
+    let (base_url, server) = spawn_relay_test_server(vec![relay_test_http_response(
+        "200 OK",
+        r#"{"object":"chat.completion","choices":[]}"#,
+    )])
+    .await;
+    let profile = relay_test_profile(base_url, RelayProtocol::ChatCompletions);
+
+    let error = test_relay_profile(&profile, "grok-4")
+        .await
+        .expect_err("2xx chat response with empty choices must fail");
+    server.await.unwrap();
+
+    assert!(error.to_string().contains("choices"));
+}
+
+#[tokio::test]
+async fn relay_connection_test_accepts_chat_completions_with_extractable_content() {
+    let (base_url, server) = spawn_relay_test_server(vec![relay_test_http_response(
+        "200 OK",
+        r#"{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}"#,
+    )])
+    .await;
+    let profile = relay_test_profile(base_url, RelayProtocol::ChatCompletions);
+
+    let result = test_relay_profile(&profile, "grok-4").await.unwrap();
+    server.await.unwrap();
+
+    assert_eq!(result.http_status, 200);
 }
 
 #[test]
@@ -346,6 +537,34 @@ fn apply_chat_protocol_relay_points_codex_to_local_responses_proxy() {
 }
 
 #[test]
+fn apply_chat_protocol_profile_overrides_imported_chat_wire_api() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "imported-chat".to_string(),
+        relay_mode: RelayMode::PureApi,
+        protocol: RelayProtocol::ChatCompletions,
+        config_contents: r#"model_provider = "imported"
+
+[model_providers.imported]
+name = "imported"
+wire_api = "chat"
+requires_openai_auth = true
+base_url = "https://chat-only.example.test/v1"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test-redacted"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+
+    assert!(updated.contains(r#"wire_api = "responses""#));
+    assert!(!updated.contains(r#"wire_api = "chat""#));
+    assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+}
+
+#[test]
 fn responses_profile_stays_direct_and_backfill_repairs_legacy_local_proxy() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
@@ -455,6 +674,146 @@ base_url = "http://127.0.0.1:57321/v1"
     let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(!live.contains("codex_plus_chat_base_url"));
     assert!(live.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+}
+
+#[test]
+fn backfill_chat_profile_adopts_manually_edited_external_live_upstream() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model = "claude-sonnet-4"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://manual.example/v1"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("auth.json"),
+        r#"{"OPENAI_API_KEY":"sk-live"}"#,
+    )
+    .unwrap();
+    let mut profile = RelayProfile {
+        id: "chat".to_string(),
+        protocol: RelayProtocol::ChatCompletions,
+        relay_mode: RelayMode::PureApi,
+        upstream_base_url: "https://stale.example/v1".to_string(),
+        base_url: "https://stale.example/v1".to_string(),
+        config_contents: r#"model = "stale-model"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://127.0.0.1:57321/v1"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-stale"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+    let mut common = String::new();
+
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+
+    assert_eq!(profile.upstream_base_url, "https://manual.example/v1");
+    assert_eq!(profile.base_url, "https://manual.example/v1");
+}
+
+#[test]
+fn backfill_chat_profile_keeps_saved_upstream_for_local_proxy_live_url() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model = "claude-sonnet-4"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://127.0.0.1:57321/v1/"
+"#,
+    )
+    .unwrap();
+    let mut profile = RelayProfile {
+        id: "chat".to_string(),
+        protocol: RelayProtocol::ChatCompletions,
+        relay_mode: RelayMode::PureApi,
+        upstream_base_url: "https://upstream.example/v1".to_string(),
+        base_url: "https://upstream.example/v1".to_string(),
+        config_contents: r#"model = "stale-model"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://127.0.0.1:57321/v1"
+"#
+        .to_string(),
+        ..RelayProfile::default()
+    };
+    let mut common = String::new();
+
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+
+    assert_eq!(profile.upstream_base_url, "https://upstream.example/v1");
+    assert_eq!(profile.base_url, "https://upstream.example/v1");
+}
+
+#[test]
+fn backfill_chat_profile_keeps_saved_upstream_for_local_proxy_aliases() {
+    for live_base_url in ["http://localhost:57321/v1", "http://[::1]:57321/v1/"] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            format!(
+                r#"model = "claude-sonnet-4"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "{live_base_url}"
+"#,
+            ),
+        )
+        .unwrap();
+        let mut profile = RelayProfile {
+            id: "chat".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            relay_mode: RelayMode::PureApi,
+            upstream_base_url: "https://upstream.example/v1".to_string(),
+            base_url: "https://upstream.example/v1".to_string(),
+            config_contents: r#"model = "stale-model"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://127.0.0.1:57321/v1"
+"#
+            .to_string(),
+            ..RelayProfile::default()
+        };
+        let mut common = String::new();
+
+        backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common)
+            .unwrap();
+
+        assert_eq!(
+            profile.upstream_base_url, "https://upstream.example/v1",
+            "local proxy alias {live_base_url} must not become its own upstream"
+        );
+        assert_eq!(profile.base_url, "https://upstream.example/v1");
+    }
 }
 
 #[test]
@@ -1233,20 +1592,14 @@ experimental_bearer_token = "sk-new"
 }
 
 #[test]
-fn apply_relay_profile_preserves_live_external_model_catalog() {
+fn apply_relay_profile_preserves_external_catalog_inside_same_named_directory() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        temp.path().join("config.toml"),
-        r#"model = "gpt-5.5"
-model_catalog_json = "D:/metadata/gpt56-model-catalog.json"
-"#,
-    )
-    .unwrap();
     let profile = RelayProfile {
         id: "relay-a".to_string(),
-        model: "gpt-5.6-sol".to_string(),
+        model: "qwen3-coder".to_string(),
         relay_mode: RelayMode::PureApi,
-        config_contents: r#"model = "gpt-5.6-sol"
+        config_contents: r#"model = "qwen3-coder"
+model_catalog_json = "D:/shared/model-catalogs/custom.json"
 model_provider = "custom"
 
 [model_providers.custom]
@@ -1258,15 +1611,89 @@ experimental_bearer_token = "sk-new"
 "#
         .to_string(),
         auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
-        model_list: "gpt-5.6-sol\ngpt-5.6-terra\ngpt-5.6-luna".to_string(),
+        model_list: "qwen3-coder".to_string(),
         ..RelayProfile::default()
     };
 
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(config.contains(r#"model_catalog_json = "D:/metadata/gpt56-model-catalog.json""#));
-    assert!(!config.contains("model-catalogs/relay-a.json"));
+    assert!(config.contains(r#"model_catalog_json = "D:/shared/model-catalogs/custom.json""#));
+    assert!(!temp.path().join("model-catalogs").exists());
+}
+
+#[test]
+fn apply_relay_profile_replaces_stale_live_external_catalog_when_target_declares_models() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model = "gpt-5.5"
+model_catalog_json = "D:/metadata/gpt56-model-catalog.json"
+"#,
+    )
+    .unwrap();
+    let profile = RelayProfile {
+        id: "relay-a".to_string(),
+        model: "claude-sonnet-4".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "claude-sonnet-4"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-new"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
+        model_list: "claude-sonnet-4\ngrok-4".to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(r#"model_catalog_json = "model-catalogs/relay-a.json""#));
+    assert!(!config.contains("D:/metadata/gpt56-model-catalog.json"));
+    let catalog =
+        std::fs::read_to_string(temp.path().join("model-catalogs").join("relay-a.json")).unwrap();
+    assert!(catalog.contains("claude-sonnet-4"));
+    assert!(catalog.contains("grok-4"));
+    assert!(!catalog.contains("gpt-5.5"));
+}
+
+#[test]
+fn apply_relay_profile_inherits_live_external_catalog_when_target_declares_no_models() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model_catalog_json = "D:/metadata/shared-model-catalog.json"
+"#,
+    )
+    .unwrap();
+    let profile = RelayProfile {
+        id: "relay-a".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-new"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(r#"model_catalog_json = "D:/metadata/shared-model-catalog.json""#));
     assert!(!temp.path().join("model-catalogs").exists());
 }
 
@@ -1304,6 +1731,71 @@ experimental_bearer_token = "sk-new"
     // After fix: custom models now generate catalog, replacing previous managed catalog
     assert!(config.contains("model_catalog_json"));
     assert!(config.contains("model-catalogs/relay-a.json"));
+}
+
+#[test]
+fn apply_relay_profile_replaces_managed_catalog_pointer_copied_from_another_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "relay-copy".to_string(),
+        model: "claude-sonnet-4".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "claude-sonnet-4"
+model_catalog_json = "model-catalogs/relay-source.json"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-new"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
+        model_list: "claude-sonnet-4".to_string(),
+        model_windows: r#"{"claude-sonnet-4":"200000"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(r#"model_catalog_json = "model-catalogs/relay-copy.json""#));
+    assert!(!config.contains("relay-source.json"));
+    let catalog =
+        std::fs::read_to_string(temp.path().join("model-catalogs").join("relay-copy.json"))
+            .unwrap();
+    assert!(catalog.contains("claude-sonnet-4"));
+    assert!(catalog.contains("200000"));
+}
+
+#[test]
+fn apply_relay_profile_removes_copied_managed_catalog_when_models_are_cleared() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "relay-copy".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model_catalog_json = "model-catalogs/relay-source.json"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-new"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(!config.contains("model_catalog_json"));
+    assert!(!temp.path().join("model-catalogs").exists());
 }
 
 #[test]
@@ -3508,6 +4000,96 @@ experimental_bearer_token = "sk-new"
         std::fs::read_to_string(temp.path().join("model-catalogs").join("relay-a.json")).unwrap();
     assert!(catalog.contains(r#""context_window": 1000000"#));
     assert!(!catalog.contains(r#""context_window": 200000"#));
+}
+
+#[test]
+fn direct_profile_apply_rolls_back_catalog_when_later_auth_validation_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("model-catalogs/relay-a.json");
+    std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+    let old_catalog = br#"{"models":[{"slug":"old-model"}]}"#;
+    std::fs::write(&catalog_path, old_catalog).unwrap();
+    let old_config = r#"model = "old-model"
+model_provider = "custom"
+model_catalog_json = "model-catalogs/relay-a.json"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://old.example/v1"
+"#;
+    let old_auth = r#"{"OPENAI_API_KEY":"sk-old"}"#;
+    std::fs::write(temp.path().join("config.toml"), old_config).unwrap();
+    std::fs::write(temp.path().join("auth.json"), old_auth).unwrap();
+    let profile = RelayProfile {
+        id: "relay-a".to_string(),
+        model: "grok-4".to_string(),
+        model_list: "grok-4\nclaude-sonnet-4".to_string(),
+        model_windows: r#"{"grok-4":"1000000"}"#.to_string(),
+        base_url: "https://new.example/v1".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: old_config.to_string(),
+        auth_contents: "{invalid auth json".to_string(),
+        ..RelayProfile::default()
+    };
+
+    let error = apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "")
+        .expect_err("invalid auth must fail after catalog generation");
+
+    assert!(error.to_string().contains("auth.json"));
+    assert_eq!(std::fs::read(&catalog_path).unwrap(), old_catalog);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("config.toml")).unwrap(),
+        old_config
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+        old_auth
+    );
+}
+
+#[test]
+fn direct_profile_files_apply_removes_new_catalog_when_later_auth_validation_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("model-catalogs/relay-a.json");
+    let old_config = r#"model = "old-model"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://old.example/v1"
+"#;
+    let old_auth = r#"{"OPENAI_API_KEY":"sk-old"}"#;
+    std::fs::write(temp.path().join("config.toml"), old_config).unwrap();
+    std::fs::write(temp.path().join("auth.json"), old_auth).unwrap();
+    let profile = RelayProfile {
+        id: "relay-a".to_string(),
+        model: "grok-4".to_string(),
+        model_list: "grok-4\nclaude-sonnet-4".to_string(),
+        model_windows: r#"{"grok-4":"1000000"}"#.to_string(),
+        base_url: "https://new.example/v1".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: old_config.to_string(),
+        auth_contents: "{invalid auth json".to_string(),
+        ..RelayProfile::default()
+    };
+
+    let error = apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "")
+        .expect_err("invalid auth must fail after catalog generation");
+
+    assert!(error.to_string().contains("auth.json"));
+    assert!(!catalog_path.exists());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("config.toml")).unwrap(),
+        old_config
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+        old_auth
+    );
 }
 
 #[test]

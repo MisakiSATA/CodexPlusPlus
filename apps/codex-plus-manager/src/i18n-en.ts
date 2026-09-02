@@ -276,8 +276,8 @@ export const EN_PLAIN: Record<string, string> = {
   "关闭": "Off",
   "关闭后会停用删除、导出、项目移动、插件相关和菜单位置增强。":
     "When off, disables deletion, export, project move, plugin-related and menu placement enhancements.",
-  "关闭后本工具不会在手动切换时写入 Codex 的 config.toml / auth.json；启动 Codex 时始终不会自动改这些文件。":
-    "When off, this tool won't write Codex's config.toml / auth.json on manual switches; it never auto-modifies these files when launching Codex.",
+  "关闭后，手动切换和启动 Codex 都不会写入 config.toml / auth.json；开启后，通过 Codex++ 启动时会重新应用当前 API 或聚合供应商，纯官方登录配置除外。":
+    "When off, neither manual switching nor launching Codex writes config.toml / auth.json. When on, launching through Codex++ reapplies the current API or aggregate provider, except a pure official login profile.",
   "兼容增强": "Compatible enhancement",
   "内容来自 BigPizzaV3/Ad-List，分为赞助商推荐和普通推荐。":
     "Content comes from BigPizzaV3/Ad-List, split into sponsor recommendations and regular recommendations.",
@@ -445,6 +445,7 @@ export const EN_PLAIN: Record<string, string> = {
   "当前使用中：打开时从 ~/.codex/auth.json 回填，保存后会作为此供应商 auth 存档":
     "Currently in use: backfilled from ~/.codex/auth.json when opened; saving stores it as this provider's auth archive",
   "当前供应商 config.toml 里没有可提取的通用配置。": "The current provider's config.toml has no extractable common config.",
+  "当前供应商使用中，请先切换到其他供应商再删除": "This provider is in use. Switch to another provider before deleting it.",
   "当前供应商切换后会写入的预览；上下文开关变化会立即反映": "Preview of what the current provider writes after switching; context toggles are reflected immediately",
   "当前供应商还没有完整 config.toml / API Key 存档。": "The current provider doesn't have a complete config.toml / API Key archive yet.",
   "当前共有": "There are currently ",

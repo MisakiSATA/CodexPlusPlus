@@ -278,6 +278,9 @@ fn update_tray_labels<R: tauri::Runtime>(
 }
 
 async fn apply_dream_skin_from_tray() -> anyhow::Result<()> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let relay_switch_lock =
+        codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await?;
     let store = codex_plus_core::settings::SettingsStore::default();
     let current = store.load()?;
     if !current.enhancements_enabled {
@@ -292,6 +295,7 @@ async fn apply_dream_skin_from_tray() -> anyhow::Result<()> {
         true,
         &settings.codex_app_dream_skin_theme_config,
     )?;
+    drop(relay_switch_lock);
     codex_plus_core::dream_skin_runtime::apply_dream_skin_live(
         DREAM_SKIN_DEBUG_PORT,
         codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,

@@ -12,7 +12,9 @@ use std::sync::OnceLock;
 #[cfg(windows)]
 use anyhow::Context;
 #[cfg(windows)]
-use windows::Win32::Foundation::{BOOL, CloseHandle, HANDLE, HWND, LPARAM, MAX_PATH, WPARAM};
+use windows::Win32::Foundation::{
+    BOOL, CloseHandle, ERROR_NO_MORE_FILES, HANDLE, HWND, LPARAM, MAX_PATH, WPARAM,
+};
 #[cfg(windows)]
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -297,11 +299,15 @@ pub fn delete_current_user_key(subkey: &str) -> anyhow::Result<()> {
 
 #[cfg(windows)]
 pub fn enumerate_processes() -> Vec<WindowsProcessInfo> {
-    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        return Vec::new();
-    };
+    try_enumerate_processes().unwrap_or_default()
+}
+
+#[cfg(windows)]
+pub fn try_enumerate_processes() -> anyhow::Result<Vec<WindowsProcessInfo>> {
+    let snapshot =
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.context("创建进程快照失败")?;
     if snapshot.is_invalid() {
-        return Vec::new();
+        anyhow::bail!("创建进程快照返回了无效句柄");
     }
     let _guard = HandleGuard(snapshot);
     let mut entry = PROCESSENTRY32W {
@@ -309,9 +315,7 @@ pub fn enumerate_processes() -> Vec<WindowsProcessInfo> {
         ..Default::default()
     };
     let mut processes = Vec::new();
-    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_err() {
-        return Vec::new();
-    }
+    unsafe { Process32FirstW(snapshot, &mut entry) }.context("读取进程快照首项失败")?;
     loop {
         let process_id = entry.th32ProcessID;
         processes.push(WindowsProcessInfo {
@@ -320,11 +324,13 @@ pub fn enumerate_processes() -> Vec<WindowsProcessInfo> {
             exe_file: nul_terminated_wide_to_string(&entry.szExeFile),
             executable_path: query_process_image_path(process_id),
         });
-        if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
-            break;
+        match unsafe { Process32NextW(snapshot, &mut entry) } {
+            Ok(()) => {}
+            Err(error) if error.code() == ERROR_NO_MORE_FILES.to_hresult() => break,
+            Err(error) => return Err(error).context("读取进程快照后续项失败"),
         }
     }
-    processes
+    Ok(processes)
 }
 
 #[cfg(windows)]

@@ -2,6 +2,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::Context;
+use fs2::FileExt;
 
 use crate::relay_config::{
     backfill_relay_profile_from_home_with_common, relay_config_status_from_home,
@@ -15,11 +16,99 @@ pub struct RelaySwitchResult {
     pub backup_path: Option<String>,
 }
 
+pub struct RelaySwitchLockGuard {
+    file: std::fs::File,
+}
+
+impl Drop for RelaySwitchLockGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+/// 默认锁等待上限。切换/启动的配置写入阶段通常几秒内完成；等不到锁时必须报错返回，
+/// 绝不能把调用方（尤其是 Manager 的命令线程）无限挂起，否则界面会整体卡死。
+pub const RELAY_SWITCH_LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+const RELAY_SWITCH_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+pub fn acquire_relay_switch_lock(home: &Path) -> anyhow::Result<RelaySwitchLockGuard> {
+    acquire_relay_switch_lock_with_timeout(home, RELAY_SWITCH_LOCK_WAIT_TIMEOUT)
+}
+
+pub fn acquire_relay_switch_lock_with_timeout(
+    home: &Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<RelaySwitchLockGuard> {
+    let lock_dir = home.join("tmp");
+    std::fs::create_dir_all(&lock_dir)
+        .with_context(|| format!("创建供应商切换锁目录失败：{}", lock_dir.to_string_lossy()))?;
+    let lock_path = lock_dir.join("codex-plus-relay-switch.lock");
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("打开供应商切换锁失败：{}", lock_path.to_string_lossy()))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(RelaySwitchLockGuard { file }),
+            Err(error) if is_lock_contention(&error) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "等待供应商切换锁超时（{} 秒）：另一个供应商切换、导入或 Codex 启动可能正在进行，请稍后重试。锁文件：{}",
+                        timeout.as_secs().max(1),
+                        lock_path.to_string_lossy()
+                    );
+                }
+                std::thread::sleep(RELAY_SWITCH_LOCK_RETRY_INTERVAL);
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "获取供应商切换锁失败：{}",
+                    lock_path.to_string_lossy()
+                )));
+            }
+        }
+    }
+}
+
+fn is_lock_contention(error: &std::io::Error) -> bool {
+    let contended = fs2::lock_contended_error();
+    error.kind() == contended.kind() && error.raw_os_error() == contended.raw_os_error()
+}
+
+pub async fn acquire_relay_switch_lock_async(home: &Path) -> anyhow::Result<RelaySwitchLockGuard> {
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || acquire_relay_switch_lock(&home))
+        .await
+        .context("等待供应商切换锁任务失败")?
+}
+
 pub fn switch_relay_profile_in_home(
     store: &SettingsStore,
     home: &Path,
     next_settings: BackendSettings,
     previous_active_relay_id: &str,
+) -> anyhow::Result<RelaySwitchResult> {
+    let relay_switch_lock = acquire_relay_switch_lock(home)?;
+    switch_relay_profile_in_home_with_lock(
+        store,
+        home,
+        next_settings,
+        previous_active_relay_id,
+        &relay_switch_lock,
+    )
+}
+
+pub fn switch_relay_profile_in_home_with_lock(
+    store: &SettingsStore,
+    home: &Path,
+    next_settings: BackendSettings,
+    previous_active_relay_id: &str,
+    _relay_switch_lock: &RelaySwitchLockGuard,
 ) -> anyhow::Result<RelaySwitchResult> {
     let mut selected_settings = next_settings;
     if !selected_settings.relay_profiles_enabled {
@@ -27,20 +116,38 @@ pub fn switch_relay_profile_in_home(
     }
     crate::codex_app_state::capture_app_state_snapshot_nonfatal(home, "relay_switch.before");
 
-    let original_settings = store.load().unwrap_or_default();
-    let live_snapshot = LiveFilesSnapshot::capture(home).context("读取当前 Codex 实时配置失败")?;
+    let original_settings = store.load().context("读取当前供应商设置失败")?;
+    let previous_active_relay_id = previous_active_relay_id.trim();
+    if !previous_active_relay_id.is_empty()
+        && original_settings.active_relay_id != previous_active_relay_id
+    {
+        anyhow::bail!(
+            "供应商切换请求已过期：当前供应商已从「{}」变为「{}」，请刷新后重试。",
+            previous_active_relay_id,
+            original_settings.active_relay_id
+        );
+    }
+    let selected_catalog_path = crate::relay_config::managed_model_catalog_path(
+        home,
+        &selected_settings.active_relay_profile().id,
+    );
+    let live_snapshot = LiveFilesSnapshot::capture(home, selected_catalog_path)
+        .context("读取当前 Codex 实时配置失败")?;
     if !previous_active_relay_id.trim().is_empty()
         && previous_active_relay_id != selected_settings.active_relay_id
     {
         backfill_profile_before_switch(home, &mut selected_settings, previous_active_relay_id)?;
     }
 
-    store
-        .save(&selected_settings)
-        .context("保存供应商设置失败")?;
-    let selected_settings = store.load().context("读取供应商设置失败")?;
+    let switch_result = (|| {
+        store
+            .save(&selected_settings)
+            .context("保存供应商设置失败")?;
+        let selected_settings = store.load().context("读取供应商设置失败")?;
+        apply_selected_relay_profile(home, &selected_settings)
+    })();
 
-    match apply_selected_relay_profile(home, &selected_settings) {
+    match switch_result {
         Ok(result) => {
             crate::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
                 home,
@@ -71,23 +178,42 @@ pub fn switch_relay_profile_in_home(
 struct LiveFilesSnapshot {
     config: Option<Vec<u8>>,
     auth: Option<Vec<u8>>,
+    managed_catalog_path: std::path::PathBuf,
+    managed_catalog: Option<Vec<u8>>,
 }
 
 impl LiveFilesSnapshot {
-    fn capture(home: &Path) -> anyhow::Result<Self> {
+    fn capture(home: &Path, managed_catalog_path: std::path::PathBuf) -> anyhow::Result<Self> {
         Ok(Self {
             config: read_optional_bytes(&home.join("config.toml"))?,
             auth: read_optional_bytes(&home.join("auth.json"))?,
+            managed_catalog: read_optional_bytes(&managed_catalog_path)?,
+            managed_catalog_path,
         })
     }
 
     fn restore(&self, home: &Path) -> anyhow::Result<()> {
-        std::fs::create_dir_all(home)?;
-        restore_optional_file(&home.join("config.toml"), self.config.as_deref())
-            .context("恢复 config.toml 失败")?;
-        restore_optional_file(&home.join("auth.json"), self.auth.as_deref())
-            .context("恢复 auth.json 失败")?;
-        Ok(())
+        let mut errors = Vec::new();
+        if let Err(error) =
+            restore_optional_file(&self.managed_catalog_path, self.managed_catalog.as_deref())
+        {
+            errors.push(format!("恢复模型 catalog 失败：{error:#}"));
+        }
+        if let Err(error) = std::fs::create_dir_all(home) {
+            errors.push(format!("恢复 Codex 配置目录失败：{error:#}"));
+        }
+        if let Err(error) = restore_optional_file(&home.join("config.toml"), self.config.as_deref())
+        {
+            errors.push(format!("恢复 config.toml 失败：{error:#}"));
+        }
+        if let Err(error) = restore_optional_file(&home.join("auth.json"), self.auth.as_deref()) {
+            errors.push(format!("恢复 auth.json 失败：{error:#}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(errors.join("；"))
+        }
     }
 }
 
@@ -137,7 +263,7 @@ fn apply_selected_relay_profile(
     let result = if relay.relay_mode == RelayMode::Official && !relay.official_mix_api_key {
         let auth_contents =
             (!relay.auth_contents.trim().is_empty()).then_some(relay.auth_contents.as_str());
-        crate::relay_config::clear_relay_config_to_home_with_auth_and_computer_use_guard(
+        crate::relay_config::clear_relay_config_for_official_switch(
             home,
             auth_contents,
             settings.computer_use_guard_enabled,
@@ -206,5 +332,40 @@ fn relay_combined_common_config(settings: &BackendSettings) -> String {
         String::new()
     } else {
         crate::relay_config::normalize_config_text(&format!("{}\n", sections.join("\n\n")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_snapshot_restore_attempts_every_file_and_aggregates_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let catalog_path = home.join("model-catalogs/profile.json");
+        std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        std::fs::write(home.join("config.toml"), "model = \"original\"\n").unwrap();
+        std::fs::write(home.join("auth.json"), "{\"token\":\"original\"}\n").unwrap();
+        std::fs::write(&catalog_path, "{\"models\":[]}").unwrap();
+        let snapshot = LiveFilesSnapshot::capture(&home, catalog_path.clone()).unwrap();
+
+        std::fs::write(home.join("config.toml"), "model = \"changed\"\n").unwrap();
+        std::fs::remove_file(home.join("auth.json")).unwrap();
+        std::fs::create_dir(home.join("auth.json")).unwrap();
+        std::fs::remove_file(&catalog_path).unwrap();
+        std::fs::create_dir(&catalog_path).unwrap();
+
+        let error = snapshot
+            .restore(&home)
+            .expect_err("directory targets must make catalog and auth restoration fail");
+        let message = error.to_string();
+
+        assert!(message.contains("模型 catalog"), "{message}");
+        assert!(message.contains("auth.json"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).unwrap(),
+            "model = \"original\"\n"
+        );
     }
 }

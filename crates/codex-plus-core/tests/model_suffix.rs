@@ -100,6 +100,32 @@ fn build_catalog_json_uses_fallback_for_no_suffix_entries() {
 }
 
 #[test]
+fn build_catalog_json_uses_runtime_compatible_generic_metadata() {
+    let entries =
+        collect_catalog_entries("claude-opus-5\ngrok-4.5", &HashMap::new(), "claude-opus-5");
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+
+    for model in catalog["models"].as_array().unwrap() {
+        assert_eq!(model["supported_reasoning_levels"], serde_json::json!([]));
+        assert_eq!(model["shell_type"], "shell_command");
+        assert_eq!(model["support_verbosity"], false);
+        assert_eq!(
+            model["truncation_policy"],
+            serde_json::json!({ "mode": "tokens", "limit": 10_000 })
+        );
+        assert_eq!(model["experimental_supported_tools"], serde_json::json!([]));
+
+        let instructions = model["base_instructions"]
+            .as_str()
+            .expect("generic model metadata must provide neutral base instructions");
+        assert!(instructions.starts_with("You are Codex, a coding agent."));
+        assert!(!instructions.contains("GPT"));
+        assert!(model.get("model_messages").is_none());
+    }
+}
+
+#[test]
 fn build_catalog_json_uses_runtime_compatible_gpt56_metadata() {
     let entries = collect_catalog_entries(
         "gpt-5.6-sol\ngpt-5.6-terra\ngpt-5.6-luna",

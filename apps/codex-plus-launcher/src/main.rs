@@ -133,7 +133,13 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
 
 async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
     let hooks = LauncherHooks::default();
+    let home = hooks.resolve_codex_home();
+    let relay_switch_lock =
+        codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await?;
     let settings = hooks.load_settings().await?;
+    if codex_plus_core::launcher::should_apply_active_relay_profile_at_launch(&settings) {
+        hooks.apply_active_relay_profile(&settings, &home).await?;
+    }
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let launch_result = hooks
         .launch_codex(
@@ -143,35 +149,20 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             &settings.codex_extra_args,
         )
         .await;
-    if settings.enhancements_enabled {
-        hooks.start_helper(options.helper_port).await?;
-    }
+    drop(relay_switch_lock);
     let process_ids = codex_plus_core::watcher::find_codex_processes();
-    let mut activated = false;
-    #[cfg(windows)]
-    {
-        for process_id in &process_ids {
-            if codex_plus_core::windows_activate_process_window(*process_id) {
-                activated = true;
-                break;
-            }
+    let activated = {
+        #[cfg(windows)]
+        {
+            process_ids
+                .iter()
+                .any(|process_id| codex_plus_core::windows_activate_process_window(*process_id))
         }
-    }
-    let injection_ready = if settings.enhancements_enabled {
-        hooks
-            .ensure_injection(options.debug_port, options.helper_port, &app_dir)
-            .await
-    } else {
-        false
+        #[cfg(not(windows))]
+        {
+            false
+        }
     };
-    if injection_ready {
-        hooks
-            .start_bridge_watchdog(options.debug_port, options.helper_port)
-            .await?;
-        hooks.write_status("running").await;
-    } else if settings.enhancements_enabled {
-        hooks.write_status("running_degraded").await;
-    }
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "launcher.activate_existing_codex",
         json!({
@@ -180,7 +171,7 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             "helper_port": options.helper_port,
             "process_ids": process_ids,
             "activated": activated,
-            "injection_ready": injection_ready,
+            "runtime_owner": "primary_launcher",
             "launch_ok": launch_result.is_ok(),
             "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
         }),
@@ -276,18 +267,24 @@ impl LaunchHooks for LauncherHooks {
         self.core.load_settings().await
     }
 
-    async fn run_provider_sync(&self) -> anyhow::Result<()> {
-        let _ = tokio::task::spawn_blocking(|| codex_plus_data::run_provider_sync(None))
-            .await
-            .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"))?;
+    async fn run_provider_sync(&self, codex_home: &Path) -> anyhow::Result<()> {
+        let codex_home = codex_home.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            codex_plus_data::run_provider_sync(Some(&codex_home))
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"))?;
         Ok(())
     }
 
     async fn apply_active_relay_profile(
         &self,
         settings: &codex_plus_core::settings::BackendSettings,
+        codex_home: &Path,
     ) -> anyhow::Result<()> {
-        self.core.apply_active_relay_profile(settings).await
+        self.core
+            .apply_active_relay_profile(settings, codex_home)
+            .await
     }
 
     async fn ensure_computer_use_config(
@@ -300,8 +297,11 @@ impl LaunchHooks for LauncherHooks {
     async fn ensure_plugin_marketplace_config(
         &self,
         settings: &codex_plus_core::settings::BackendSettings,
+        relay_switch_lock: &codex_plus_core::relay_switch::RelaySwitchLockGuard,
     ) -> anyhow::Result<()> {
-        self.core.ensure_plugin_marketplace_config(settings).await
+        self.core
+            .ensure_plugin_marketplace_config(settings, relay_switch_lock)
+            .await
     }
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
@@ -374,8 +374,11 @@ impl LaunchHooks for LauncherHooks {
         self.core.shutdown_helper(helper_port).await;
     }
 
-    async fn terminate_codex(&self, launch: &codex_plus_core::launcher::CodexLaunch) {
-        self.core.terminate_codex(launch).await;
+    async fn terminate_codex(
+        &self,
+        launch: &codex_plus_core::launcher::CodexLaunch,
+    ) -> anyhow::Result<()> {
+        self.core.terminate_codex(launch).await
     }
 }
 
@@ -802,6 +805,32 @@ mod tests {
     }
 
     #[test]
+    fn existing_launcher_activation_reapplies_active_relay_before_launching() {
+        let source = include_str!("main.rs");
+        let start = source.find("async fn activate_existing_codex_app").unwrap();
+        let end = source[start..]
+            .find("fn log_launcher_already_running")
+            .map(|offset| start + offset)
+            .unwrap();
+        let activation = &source[start..end];
+
+        let lock_index = activation
+            .find("acquire_relay_switch_lock_async")
+            .expect("existing-instance activation must serialize relay configuration");
+        let apply_index = activation
+            .find("apply_active_relay_profile")
+            .expect("existing-instance activation must replay the active relay profile");
+        let launch_index = activation
+            .find(".launch_codex(")
+            .expect("existing-instance activation must launch or activate Codex");
+        assert!(lock_index < apply_index);
+        assert!(apply_index < launch_index);
+        assert!(!activation.contains("start_helper"));
+        assert!(!activation.contains("ensure_injection"));
+        assert!(!activation.contains("start_bridge_watchdog"));
+    }
+
+    #[test]
     fn launcher_hooks_forward_runtime_watchdogs_and_computer_use_guard_methods() {
         let source = include_str!("main.rs");
 
@@ -809,8 +838,19 @@ mod tests {
         assert!(source.contains(".start_bridge_watchdog(debug_port, helper_port)"));
         assert!(source.contains("async fn ensure_computer_use_config"));
         assert!(source.contains("self.core.ensure_computer_use_config(settings).await"));
-        assert!(source.contains("async fn ensure_plugin_marketplace_config"));
-        assert!(source.contains("self.core.ensure_plugin_marketplace_config(settings).await"));
+        let marketplace_hook_start = source
+            .find("async fn ensure_plugin_marketplace_config")
+            .unwrap();
+        let marketplace_hook_end = source[marketplace_hook_start..]
+            .find("async fn start_helper")
+            .map(|offset| marketplace_hook_start + offset)
+            .unwrap();
+        let marketplace_hook = &source[marketplace_hook_start..marketplace_hook_end];
+        assert!(marketplace_hook.contains("relay_switch_lock"));
+        assert!(
+            marketplace_hook
+                .contains(".ensure_plugin_marketplace_config(settings, relay_switch_lock)")
+        );
         assert!(source.contains("async fn start_computer_use_guard_watchdog"));
         assert!(source.contains("self.core"));
         assert!(source.contains(".start_computer_use_guard_watchdog(settings)"));

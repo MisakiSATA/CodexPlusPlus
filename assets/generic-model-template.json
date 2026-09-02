@@ -4,6 +4,15 @@
       "slug": "generic-custom-model",
       "display_name": "Custom Model",
       "description": "Custom model",
+      "base_instructions": "You are Codex, a coding agent. You and the user share one workspace. Follow the developer and user instructions provided in the conversation. Use the available tools to inspect, edit, and verify the workspace as needed. Be precise, safe, and helpful.",
+      "supported_reasoning_levels": [],
+      "shell_type": "shell_command",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "experimental_supported_tools": [],
       "context_window": 272000,
       "max_context_window": 272000,
       "effective_context_window_percent": 100,

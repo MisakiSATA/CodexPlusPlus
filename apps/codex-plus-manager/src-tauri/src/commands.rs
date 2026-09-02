@@ -562,10 +562,48 @@ pub fn load_settings() -> CommandResult<SettingsPayload> {
 }
 
 #[tauri::command]
-pub fn save_settings(settings: BackendSettings) -> CommandResult<SettingsPayload> {
+pub async fn save_settings(settings: BackendSettings) -> CommandResult<SettingsPayload> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                let settings = normalize_settings_before_save(settings);
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    SettingsPayload {
+                        settings,
+                        settings_path: codex_plus_core::paths::default_settings_path()
+                            .to_string_lossy()
+                            .to_string(),
+                        user_scripts: user_script_inventory(),
+                    },
+                );
+            }
+        };
+    save_settings_without_relay_switch_lock(settings)
+}
+
+fn save_settings_without_relay_switch_lock(
+    settings: BackendSettings,
+) -> CommandResult<SettingsPayload> {
     let settings = normalize_settings_before_save(settings);
     let store = SettingsStore::default();
-    let previous = store.load().unwrap_or_default();
+    let previous = match store.load() {
+        Ok(settings) => settings,
+        Err(error) => {
+            return failed(
+                &format!("保存前读取设置失败：{error}"),
+                SettingsPayload {
+                    settings,
+                    settings_path: codex_plus_core::paths::default_settings_path()
+                        .to_string_lossy()
+                        .to_string(),
+                    user_scripts: user_script_inventory(),
+                },
+            );
+        }
+    };
     let dream_skin_enabled = settings.enhancements_enabled && settings.codex_app_dream_skin_enabled;
     if let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
         dream_skin_enabled,
@@ -604,7 +642,18 @@ pub fn save_settings(settings: BackendSettings) -> CommandResult<SettingsPayload
 }
 
 #[tauri::command]
-pub fn import_dream_skin_image(path: String) -> CommandResult<DreamSkinImagePayload> {
+pub async fn import_dream_skin_image(path: String) -> CommandResult<DreamSkinImagePayload> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    empty_dream_skin_image_payload(),
+                );
+            }
+        };
     let source = PathBuf::from(path.trim());
     let state_dir = codex_plus_core::paths::default_app_state_dir();
     let store = SettingsStore::default();
@@ -648,7 +697,18 @@ pub fn import_dream_skin_image(path: String) -> CommandResult<DreamSkinImagePayl
 }
 
 #[tauri::command]
-pub fn reset_dream_skin_image() -> CommandResult<DreamSkinImagePayload> {
+pub async fn reset_dream_skin_image() -> CommandResult<DreamSkinImagePayload> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    empty_dream_skin_image_payload(),
+                );
+            }
+        };
     let state_dir = codex_plus_core::paths::default_app_state_dir();
     let store = SettingsStore::default();
     let previous = store.load().unwrap_or_default();
@@ -860,6 +920,18 @@ pub fn delete_dream_skin_theme(
 pub async fn activate_dream_skin_theme(
     request: DreamSkinThemeActivationRequest,
 ) -> CommandResult<DreamSkinThemeActivationPayload> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                let settings = SettingsStore::default().load().unwrap_or_default();
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    failed_dream_skin_activation_payload(&settings, request.debug_port).await,
+                );
+            }
+        };
     let state_dir = codex_plus_core::paths::default_app_state_dir();
     let store = SettingsStore::default();
     let previous = store.load().unwrap_or_default();
@@ -873,6 +945,7 @@ pub async fn activate_dream_skin_theme(
     ) {
         Ok(activation) => activation,
         Err(error) => {
+            drop(relay_switch_lock);
             return failed(
                 &format!("准备 Dream Skin 主题失败：{error}"),
                 failed_dream_skin_activation_payload(&previous, request.debug_port).await,
@@ -892,6 +965,7 @@ pub async fn activate_dream_skin_theme(
                 let _ = restore_managed_dream_skin_image_backup(backup);
             }
             let _ = store.save(&previous);
+            drop(relay_switch_lock);
             return failed(
                 &format!("保存 Dream Skin 活动主题失败：{error}"),
                 failed_dream_skin_activation_payload(&previous, request.debug_port).await,
@@ -904,11 +978,17 @@ pub async fn activate_dream_skin_theme(
         && !settings.codex_app_dream_skin_paused;
     let theme_changed = previous_runtime_signature
         != codex_plus_core::assets::dream_skin_runtime_content_signature(&settings);
+    let base_theme_sync_error = should_apply
+        .then(|| {
+            codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
+                true,
+                &settings.codex_app_dream_skin_theme_config,
+            )
+        })
+        .and_then(Result::err);
+    drop(relay_switch_lock);
     let (runtime, saved_for_next_launch, message) = if should_apply {
-        if let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
-            true,
-            &settings.codex_app_dream_skin_theme_config,
-        ) {
+        if let Some(error) = base_theme_sync_error {
             (
                 codex_plus_core::dream_skin_runtime::dream_skin_status(request.debug_port).await,
                 true,
@@ -971,6 +1051,19 @@ pub async fn dream_skin_status(
 pub async fn apply_dream_skin(
     request: DreamSkinRuntimeRequest,
 ) -> CommandResult<codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus::not_running(
+                        true, false,
+                    ),
+                );
+            }
+        };
     let store = SettingsStore::default();
     let settings = match store.update(json!({ "codexAppDreamSkinPaused": false })) {
         Ok(settings) => settings,
@@ -984,6 +1077,7 @@ pub async fn apply_dream_skin(
         }
     };
     if !settings.enhancements_enabled || !settings.codex_app_dream_skin_enabled {
+        drop(relay_switch_lock);
         return failed(
             "请先启用 Codex增强和 Dream Skin。",
             codex_plus_core::dream_skin_runtime::dream_skin_status(request.debug_port).await,
@@ -993,11 +1087,13 @@ pub async fn apply_dream_skin(
         true,
         &settings.codex_app_dream_skin_theme_config,
     ) {
+        drop(relay_switch_lock);
         return failed(
             &format!("同步 Dream Skin 基础主题失败：{error}"),
             codex_plus_core::dream_skin_runtime::dream_skin_status(request.debug_port).await,
         );
     }
+    drop(relay_switch_lock);
     match codex_plus_core::dream_skin_runtime::apply_dream_skin_live(
         request.debug_port,
         request.helper_port,
@@ -1016,11 +1112,24 @@ pub async fn apply_dream_skin(
 pub async fn restore_dream_skin(
     request: DreamSkinRuntimeRequest,
 ) -> CommandResult<codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    codex_plus_core::dream_skin_runtime::dream_skin_status(request.debug_port)
+                        .await,
+                );
+            }
+        };
     let store = SettingsStore::default();
     if let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
         false,
         &codex_plus_core::settings::DreamSkinThemeConfig::default(),
     ) {
+        drop(relay_switch_lock);
         return failed(
             &format!("恢复 Codex 原始外观失败：{error}"),
             codex_plus_core::dream_skin_runtime::dream_skin_status(request.debug_port).await,
@@ -1035,6 +1144,7 @@ pub async fn restore_dream_skin(
             codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus::not_running(false, false),
         );
     }
+    drop(relay_switch_lock);
     let live = codex_plus_core::dream_skin_runtime::pause_dream_skin_live(request.debug_port).await;
     let status =
         codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus::pending_restart(false, false);
@@ -1048,7 +1158,18 @@ pub async fn restore_dream_skin(
 }
 
 #[tauri::command]
-pub fn reset_dream_skin_theme() -> CommandResult<SettingsPayload> {
+pub async fn reset_dream_skin_theme() -> CommandResult<SettingsPayload> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    fallback_settings_payload(),
+                );
+            }
+        };
     let store = SettingsStore::default();
     let previous = store.load().unwrap_or_default();
     let theme = serde_json::to_value(codex_plus_core::settings::DreamSkinThemeConfig::default())
@@ -1248,7 +1369,16 @@ pub fn load_ccs_providers() -> CommandResult<CcsProvidersPayload> {
 }
 
 #[tauri::command]
-pub fn import_ccs_providers() -> CommandResult<SettingsPayload> {
+pub async fn import_ccs_providers() -> CommandResult<SettingsPayload> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                let payload = settings_payload_value().unwrap_or_else(|(_, payload)| payload);
+                return failed(&format!("获取供应商切换锁失败：{error}"), payload);
+            }
+        };
     let providers = match codex_plus_core::ccs_import::list_codex_providers_from_default_db() {
         Ok(providers) => providers,
         Err(error) => {
@@ -1315,7 +1445,7 @@ pub fn load_pending_provider_import() -> CommandResult<PendingProviderImportPayl
 }
 
 #[tauri::command]
-pub fn confirm_pending_provider_import() -> CommandResult<SettingsPayload> {
+pub async fn confirm_pending_provider_import() -> CommandResult<SettingsPayload> {
     match codex_plus_core::provider_import::confirm_pending_provider_import() {
         Ok(Some(result)) => {
             let message = if result.imported {
@@ -1819,10 +1949,12 @@ fn ensure_text_newline(value: &str) -> String {
 #[tauri::command]
 pub async fn load_provider_sync_targets() -> CommandResult<Value> {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    let result =
-        tauri::async_runtime::spawn_blocking(|| codex_plus_data::load_provider_sync_targets(None))
-            .await
-            .map_err(|error| anyhow::anyhow!("provider target discovery task failed: {error}"));
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_data::load_provider_sync_targets(Some(&home))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("provider target discovery task failed: {error}"));
     match result {
         Ok(mut targets) => {
             let manual = settings
@@ -1888,8 +2020,9 @@ fn merge_manual_provider_sync_targets(
 
 #[tauri::command]
 pub async fn preview_session_index_cleanup() -> CommandResult<Value> {
-    let result = tauri::async_runtime::spawn_blocking(|| {
-        codex_plus_data::preview_session_index_cleanup(None)
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_data::preview_session_index_cleanup(Some(&home))
     })
     .await
     .map_err(|error| anyhow::anyhow!("session index cleanup preview task failed: {error}"))
@@ -1914,8 +2047,20 @@ pub async fn apply_session_index_cleanup(
     snapshot_sha256: String,
     thread_ids: Vec<String>,
 ) -> CommandResult<Value> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(&format!("获取供应商切换锁失败：{error}"), json!({}));
+            }
+        };
     let result = tauri::async_runtime::spawn_blocking(move || {
-        codex_plus_data::apply_session_index_cleanup(None, &snapshot_sha256, &thread_ids)
+        codex_plus_data::apply_session_index_cleanup_with_stopped_app_guard(
+            &home,
+            &snapshot_sha256,
+            &thread_ids,
+        )
     })
     .await
     .map_err(|error| anyhow::anyhow!("session index cleanup task failed: {error}"));
@@ -1952,9 +2097,17 @@ pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResul
         .filter(|value| !value.is_empty());
     let target_for_settings = target_provider.clone();
     let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(&format!("获取供应商切换锁失败：{error}"), json!({}));
+            }
+        };
     prepare_codex_app_state_before_provider_switch(&home, "manager.sync_providers_now.before");
+    let sync_home = home.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        codex_plus_data::run_provider_sync_with_target(None, target_provider.as_deref())
+        codex_plus_data::run_provider_sync_with_target(Some(&sync_home), target_provider.as_deref())
     })
     .await
     .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"));
@@ -1965,6 +2118,7 @@ pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResul
                     target_for_settings
                         .as_deref()
                         .unwrap_or(&sync.target_provider),
+                    &_relay_switch_lock,
                 );
                 finish_codex_app_state_after_provider_switch(
                     &home,
@@ -2002,7 +2156,10 @@ fn is_success_sync_status(status: &codex_plus_data::ProviderSyncStatus) -> bool 
     matches!(status, codex_plus_data::ProviderSyncStatus::Synced)
 }
 
-fn persist_provider_sync_selection(provider: &str) {
+fn persist_provider_sync_selection(
+    provider: &str,
+    _relay_switch_lock: &codex_plus_core::relay_switch::RelaySwitchLockGuard,
+) {
     let trimmed = provider.trim();
     if trimmed.is_empty() {
         return;
@@ -2541,7 +2698,18 @@ pub fn copy_diagnostics() -> CommandResult<DiagnosticsPayload> {
 }
 
 #[tauri::command]
-pub fn reset_settings() -> CommandResult<SettingsPayload> {
+pub async fn reset_settings() -> CommandResult<SettingsPayload> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    fallback_settings_payload(),
+                );
+            }
+        };
     let settings = BackendSettings::default();
     match SettingsStore::default().save(&settings) {
         Ok(()) => settings_payload("设置已重置为默认值。", "设置重置后重新读取失败"),
@@ -2559,7 +2727,18 @@ pub fn reset_settings() -> CommandResult<SettingsPayload> {
 }
 
 #[tauri::command]
-pub fn reset_image_overlay_settings() -> CommandResult<SettingsPayload> {
+pub async fn reset_image_overlay_settings() -> CommandResult<SettingsPayload> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    fallback_settings_payload(),
+                );
+            }
+        };
     let store = SettingsStore::default();
     let mut settings = store.load().unwrap_or_default();
     let defaults = BackendSettings::default();
@@ -2662,8 +2841,23 @@ pub fn remove_env_conflicts(
 }
 
 #[tauri::command]
-pub fn save_relay_file(request: SaveRelayFileRequest) -> CommandResult<RelayFilesPayload> {
+pub async fn save_relay_file(request: SaveRelayFileRequest) -> CommandResult<RelayFilesPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    relay_files_payload_from_home(&home).unwrap_or_else(|_| RelayFilesPayload {
+                        config_path: home.join("config.toml").to_string_lossy().to_string(),
+                        auth_path: home.join("auth.json").to_string_lossy().to_string(),
+                        config_contents: String::new(),
+                        auth_contents: String::new(),
+                    }),
+                );
+            }
+        };
     match save_relay_file_in_home(&home, &request.kind, &request.contents)
         .and_then(|_| relay_files_payload_from_home(&home))
     {
@@ -2764,10 +2958,22 @@ pub fn write_diagnostic_event(event: String, detail: Value) -> CommandResult<Val
 }
 
 #[tauri::command]
-pub fn backfill_relay_profile_from_live(
+pub async fn backfill_relay_profile_from_live(
     request: BackfillRelayProfileRequest,
 ) -> CommandResult<SettingsBackfillPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    SettingsBackfillPayload {
+                        settings: request.settings,
+                    },
+                );
+            }
+        };
     let mut settings = request.settings;
     let requested_profile_id = request.profile_id.clone();
     log_manager_event(
@@ -2894,10 +3100,22 @@ pub fn upsert_context_entry(request: ContextEntryRequest) -> CommandResult<Conte
 }
 
 #[tauri::command]
-pub fn sync_live_context_entries(
+pub async fn sync_live_context_entries(
     request: ContextSettingsRequest,
 ) -> CommandResult<LiveContextEntriesPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    LiveContextEntriesPayload {
+                        entries: empty_context_entries(),
+                    },
+                );
+            }
+        };
     let config_path = home.join("config.toml");
     let current_config = match read_optional_text_file(&config_path) {
         Ok(config) => config,
@@ -2934,7 +3152,9 @@ pub fn sync_live_context_entries(
             );
         }
     }
-    if let Err(error) = std::fs::write(&config_path, &updated_config) {
+    if let Err(error) =
+        codex_plus_core::settings::atomic_write(&config_path, updated_config.as_bytes())
+    {
         return failed(
             &format!("写入 live config.toml 失败：{error}"),
             LiveContextEntriesPayload {
@@ -3028,7 +3248,7 @@ pub async fn test_relay_profile(profile: RelayProfile) -> CommandResult<RelayPro
     };
     match codex_plus_core::relay_config::test_relay_profile(&profile, &test_model).await {
         Ok(result) => {
-            let status = if result.http_status < 400 {
+            let status = if relay_test_http_status_is_success(result.http_status) {
                 "ok"
             } else {
                 "failed"
@@ -3061,6 +3281,10 @@ pub async fn test_relay_profile(profile: RelayProfile) -> CommandResult<RelayPro
             },
         ),
     }
+}
+
+fn relay_test_http_status_is_success(http_status: u16) -> bool {
+    (200..300).contains(&http_status)
 }
 
 #[tauri::command]
@@ -3241,7 +3465,7 @@ pub async fn diagnose_relay_profile(profile: RelayProfile) -> CommandResult<Prov
 
     match codex_plus_core::relay_config::test_relay_profile(&profile, &test_model).await {
         Ok(result) => {
-            let status = if result.http_status < 400 {
+            let status = if relay_test_http_status_is_success(result.http_status) {
                 "ok"
             } else {
                 "failed"
@@ -3335,10 +3559,113 @@ fn provider_doctor_recommendation(checks: &[ProviderDoctorCheck]) -> String {
     "可以作为 Codex 供应商使用；如果真实对话仍失败，请查看协议代理日志里的上游响应。".to_string()
 }
 
+enum RelayApplySettings {
+    Loaded(BackendSettings),
+    Applied(codex_plus_core::relay_switch::RelaySwitchResult),
+}
+
+fn relay_apply_settings(
+    home: &Path,
+    requested_settings: Option<BackendSettings>,
+    relay_switch_lock: &codex_plus_core::relay_switch::RelaySwitchLockGuard,
+) -> Result<RelayApplySettings, CommandResult<RelayPayload>> {
+    if let Some(settings) = requested_settings {
+        let store = SettingsStore::default();
+        let previous = match store.load() {
+            Ok(settings) => settings,
+            Err(error) => {
+                let status = codex_plus_core::relay_config::relay_status_from_home(home);
+                return Err(failed(
+                    &format!("保存前读取供应商设置失败：{error}"),
+                    relay_payload(status, None),
+                ));
+            }
+        };
+        let settings = normalize_settings_before_save(settings);
+        let dream_skin_enabled =
+            settings.enhancements_enabled && settings.codex_app_dream_skin_enabled;
+        if let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
+            dream_skin_enabled,
+            &settings.codex_app_dream_skin_theme_config,
+        ) {
+            let status = codex_plus_core::relay_config::relay_status_from_home(home);
+            return Err(failed(
+                &format!("保存皮肤基础主题失败：{error}"),
+                relay_payload(status, None),
+            ));
+        }
+        let previous_active_relay_id = settings
+            .relay_profiles
+            .iter()
+            .any(|profile| profile.id == previous.active_relay_id)
+            .then_some(previous.active_relay_id.as_str())
+            .unwrap_or("")
+            .to_string();
+        return match codex_plus_core::relay_switch::switch_relay_profile_in_home_with_lock(
+            &store,
+            home,
+            settings,
+            &previous_active_relay_id,
+            relay_switch_lock,
+        ) {
+            Ok(result) => Ok(RelayApplySettings::Applied(result)),
+            Err(error) => {
+                let theme_restore_error =
+                    codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
+                        previous.enhancements_enabled && previous.codex_app_dream_skin_enabled,
+                        &previous.codex_app_dream_skin_theme_config,
+                    )
+                    .err();
+                let status = codex_plus_core::relay_config::relay_status_from_home(home);
+                let message = match theme_restore_error {
+                    Some(restore_error) => format!(
+                        "保存并应用供应商设置失败：{error}；恢复皮肤基础主题失败：{restore_error}"
+                    ),
+                    None => format!("保存并应用供应商设置失败：{error}"),
+                };
+                Err(failed(&message, relay_payload(status, None)))
+            }
+        };
+    }
+    SettingsStore::default()
+        .load()
+        .map(RelayApplySettings::Loaded)
+        .map_err(|error| {
+            let status = codex_plus_core::relay_config::relay_status_from_home(home);
+            failed(
+                &format!("读取供应商设置失败：{error}"),
+                relay_payload(status, None),
+            )
+        })
+}
+
 #[tauri::command]
-pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
+pub async fn apply_relay_injection(
+    settings: Option<BackendSettings>,
+) -> CommandResult<RelayPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
-    let settings = SettingsStore::default().load().unwrap_or_default();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                let status = codex_plus_core::relay_config::relay_status_from_home(&home);
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    relay_payload(status, None),
+                );
+            }
+        };
+    let settings = match relay_apply_settings(&home, settings, &_relay_switch_lock) {
+        Ok(RelayApplySettings::Loaded(settings)) => settings,
+        Ok(RelayApplySettings::Applied(result)) => {
+            let status = codex_plus_core::relay_config::relay_status_from_home(&home);
+            return ok(
+                "供应商设置已保存并应用。",
+                relay_payload(status, result.backup_path),
+            );
+        }
+        Err(result) => return result,
+    };
     if !settings.relay_profiles_enabled {
         let status = codex_plus_core::relay_config::relay_status_from_home(&home);
         return failed(
@@ -3487,9 +3814,32 @@ fn apply_aggregate_relay_injection_to_home(home: &Path) -> CommandResult<RelayPa
 }
 
 #[tauri::command]
-pub fn apply_pure_api_injection() -> CommandResult<RelayPayload> {
+pub async fn apply_pure_api_injection(
+    settings: Option<BackendSettings>,
+) -> CommandResult<RelayPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
-    let settings = SettingsStore::default().load().unwrap_or_default();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                let status = codex_plus_core::relay_config::relay_status_from_home(&home);
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    relay_payload(status, None),
+                );
+            }
+        };
+    let settings = match relay_apply_settings(&home, settings, &_relay_switch_lock) {
+        Ok(RelayApplySettings::Loaded(settings)) => settings,
+        Ok(RelayApplySettings::Applied(result)) => {
+            let status = codex_plus_core::relay_config::relay_status_from_home(&home);
+            return ok(
+                "纯 API 设置已保存并应用。",
+                relay_payload(status, result.backup_path),
+            );
+        }
+        Err(result) => return result,
+    };
     if !settings.relay_profiles_enabled {
         let status = codex_plus_core::relay_config::relay_status_from_home(&home);
         return failed(
@@ -3600,8 +3950,19 @@ pub fn apply_pure_api_injection() -> CommandResult<RelayPayload> {
 }
 
 #[tauri::command]
-pub fn clear_relay_injection() -> CommandResult<RelayPayload> {
+pub async fn clear_relay_injection() -> CommandResult<RelayPayload> {
     let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let _relay_switch_lock =
+        match codex_plus_core::relay_switch::acquire_relay_switch_lock_async(&home).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                let status = codex_plus_core::relay_config::relay_status_from_home(&home);
+                return failed(
+                    &format!("获取供应商切换锁失败：{error}"),
+                    relay_payload(status, None),
+                );
+            }
+        };
     let settings = SettingsStore::default().load().unwrap_or_default();
     let relay = settings.active_relay_profile();
     log_manager_event("manager.clear_relay_injection.start", json!({}));
@@ -3802,7 +4163,7 @@ fn save_relay_file_in_home(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, contents)?;
+    codex_plus_core::settings::atomic_write(&path, contents.as_bytes())?;
     Ok(())
 }
 
@@ -4186,10 +4547,613 @@ mod tests {
 
     static CODEX_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    struct TestHomeEnvGuard {
+        codex_home: Option<std::ffi::OsString>,
+        codex_sqlite_home: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+        userprofile: Option<std::ffi::OsString>,
+        settings_path: Option<PathBuf>,
+    }
+
+    impl TestHomeEnvGuard {
+        fn set(codex_home: &Path, user_home: &Path) -> Self {
+            let guard = Self {
+                codex_home: std::env::var_os("CODEX_HOME"),
+                codex_sqlite_home: std::env::var_os("CODEX_SQLITE_HOME"),
+                home: std::env::var_os("HOME"),
+                userprofile: std::env::var_os("USERPROFILE"),
+                settings_path: codex_plus_core::paths::set_settings_path_for_tests(Some(
+                    user_home.join("manager-settings.json"),
+                )),
+            };
+            unsafe {
+                std::env::set_var("CODEX_HOME", codex_home);
+                std::env::set_var("CODEX_SQLITE_HOME", codex_home);
+                std::env::set_var("HOME", user_home);
+                std::env::set_var("USERPROFILE", user_home);
+            }
+            guard
+        }
+    }
+
+    impl Drop for TestHomeEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                restore_test_env_var("CODEX_HOME", self.codex_home.take());
+                restore_test_env_var("CODEX_SQLITE_HOME", self.codex_sqlite_home.take());
+                restore_test_env_var("HOME", self.home.take());
+                restore_test_env_var("USERPROFILE", self.userprofile.take());
+            }
+            codex_plus_core::paths::set_settings_path_for_tests(self.settings_path.take());
+        }
+    }
+
+    unsafe fn restore_test_env_var(name: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+
     fn lock_codex_home_for_test() -> std::sync::MutexGuard<'static, ()> {
         CODEX_HOME_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn provider_sync_home_fixture() -> (tempfile::TempDir, TestHomeEnvGuard) {
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("custom-codex-home");
+        let user_home = temp.path().join("default-user-home");
+        let default_codex_home = user_home.join(".codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&default_codex_home).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_provider = \"codex_home_test\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            default_codex_home.join("config.toml"),
+            "model_provider = \"default_home_test\"\n",
+        )
+        .unwrap();
+        let env = TestHomeEnvGuard::set(&codex_home, &user_home);
+        (temp, env)
+    }
+
+    #[test]
+    fn provider_sync_target_command_uses_valid_codex_home_instead_of_default_user_home() {
+        let _lock = lock_codex_home_for_test();
+        let (_temp, _env) = provider_sync_home_fixture();
+
+        let targets = tauri::async_runtime::block_on(load_provider_sync_targets());
+        assert_eq!(targets.status, "ok");
+        assert_eq!(targets.payload["currentProvider"], "codex_home_test");
+    }
+
+    #[test]
+    fn provider_sync_command_uses_valid_codex_home_instead_of_default_user_home() {
+        let _lock = lock_codex_home_for_test();
+        let (_temp, _env) = provider_sync_home_fixture();
+
+        let sync = tauri::async_runtime::block_on(sync_providers_now(None));
+        assert_eq!(sync.status, "ok");
+        assert_eq!(sync.payload["targetProvider"], "codex_home_test");
+    }
+
+    #[test]
+    fn provider_sync_waits_for_cross_process_relay_switch_lock() {
+        let _lock = lock_codex_home_for_test();
+        let (_temp, _env) = provider_sync_home_fixture();
+        let codex_home = codex_plus_core::relay_config::default_codex_home_dir();
+        let relay_lock =
+            codex_plus_core::relay_switch::acquire_relay_switch_lock(&codex_home).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let sync = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = tauri::async_runtime::block_on(sync_providers_now(None));
+            finished_tx.send(result).unwrap();
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "provider sync must acquire the relay lock before taking its own provider-sync lock"
+        );
+        drop(relay_lock);
+        let result = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        sync.join().unwrap();
+        assert_eq!(result.status, "ok");
+    }
+
+    #[test]
+    fn session_index_preview_uses_effective_codex_home() {
+        let _lock = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("custom-codex-home");
+        let user_home = temp.path().join("default-user-home");
+        let default_codex_home = user_home.join(".codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&default_codex_home).unwrap();
+        let custom_id = "019f4e36-490e-7ae0-8e78-a8b3ab33a428";
+        let default_id = "019f5e36-490e-7ae0-8e78-a8b3ab33a429";
+        std::fs::write(
+            codex_home.join("session_index.jsonl"),
+            format!(
+                "{{\"id\":\"{custom_id}\",\"thread_name\":\"custom\",\"updated_at\":\"2026-01-01T00:00:00Z\"}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            default_codex_home.join("session_index.jsonl"),
+            format!(
+                "{{\"id\":\"{default_id}\",\"thread_name\":\"default\",\"updated_at\":\"2026-01-01T00:00:00Z\"}}\n"
+            ),
+        )
+        .unwrap();
+        let _env = TestHomeEnvGuard::set(&codex_home, &user_home);
+
+        let preview = tauri::async_runtime::block_on(preview_session_index_cleanup());
+
+        assert_eq!(preview.status, "ok");
+        let candidates = preview.payload["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["id"], custom_id);
+    }
+
+    #[test]
+    fn manager_relay_apply_waits_for_cross_process_relay_switch_lock() {
+        let _lock = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let user_home = temp.path().join("user-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&user_home).unwrap();
+        let _env = TestHomeEnvGuard::set(&codex_home, &user_home);
+        SettingsStore::default()
+            .save(&BackendSettings {
+                relay_profiles_enabled: true,
+                active_relay_id: "api".to_string(),
+                relay_profiles: vec![RelayProfile {
+                    id: "api".to_string(),
+                    name: "API".to_string(),
+                    relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+                    config_contents: "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://example.com/v1\"\n".to_string(),
+                    auth_contents: "{\"OPENAI_API_KEY\":\"sk-test\"}\n".to_string(),
+                    ..RelayProfile::default()
+                }],
+                ..BackendSettings::default()
+            })
+            .unwrap();
+        let relay_lock =
+            codex_plus_core::relay_switch::acquire_relay_switch_lock(&codex_home).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let apply = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            tauri::async_runtime::block_on(apply_relay_injection(None))
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!codex_home.join("config.toml").exists());
+        drop(relay_lock);
+        let result = apply.join().unwrap();
+        assert_eq!(result.status, "ok");
+        assert!(codex_home.join("config.toml").exists());
+    }
+
+    #[test]
+    fn save_settings_waits_for_cross_process_relay_switch_lock() {
+        let _lock = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let user_home = temp.path().join("user-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&user_home).unwrap();
+        let _env = TestHomeEnvGuard::set(&codex_home, &user_home);
+        let relay_lock =
+            codex_plus_core::relay_switch::acquire_relay_switch_lock(&codex_home).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let save = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            tauri::async_runtime::block_on(save_settings(BackendSettings {
+                active_relay_id: "queued".to_string(),
+                ..BackendSettings::default()
+            }))
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!user_home.join("manager-settings.json").exists());
+        drop(relay_lock);
+        let result = save.join().unwrap();
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.payload.settings.active_relay_id, "queued");
+    }
+
+    #[test]
+    fn save_relay_file_waits_for_cross_process_relay_switch_lock() {
+        let _lock = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let user_home = temp.path().join("user-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&user_home).unwrap();
+        let _env = TestHomeEnvGuard::set(&codex_home, &user_home);
+        let relay_lock =
+            codex_plus_core::relay_switch::acquire_relay_switch_lock(&codex_home).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let save = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            tauri::async_runtime::block_on(save_relay_file(SaveRelayFileRequest {
+                kind: "config".to_string(),
+                contents: "model = \"queued\"\n".to_string(),
+            }))
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!codex_home.join("config.toml").exists());
+        drop(relay_lock);
+        let result = save.join().unwrap();
+        assert_eq!(result.status, "ok");
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            "model = \"queued\"\n"
+        );
+    }
+
+    #[test]
+    fn sync_live_context_entries_waits_for_cross_process_relay_switch_lock() {
+        let _lock = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let user_home = temp.path().join("user-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&user_home).unwrap();
+        std::fs::write(codex_home.join("config.toml"), "model = \"before\"\n").unwrap();
+        let _env = TestHomeEnvGuard::set(&codex_home, &user_home);
+        let relay_lock =
+            codex_plus_core::relay_switch::acquire_relay_switch_lock(&codex_home).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let sync = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            tauri::async_runtime::block_on(sync_live_context_entries(ContextSettingsRequest {
+                settings: BackendSettings {
+                    relay_context_config_contents: "[mcp_servers.queued]\ncommand = \"queued\"\n"
+                        .to_string(),
+                    ..BackendSettings::default()
+                },
+            }))
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !std::fs::read_to_string(codex_home.join("config.toml"))
+                .unwrap()
+                .contains("mcp_servers.queued")
+        );
+        drop(relay_lock);
+        let result = sync.join().unwrap();
+        assert_eq!(result.status, "ok");
+        assert!(
+            std::fs::read_to_string(codex_home.join("config.toml"))
+                .unwrap()
+                .contains("mcp_servers.queued")
+        );
+    }
+
+    #[test]
+    fn pure_api_apply_saves_supplied_settings_inside_relay_switch_lock() {
+        let _lock = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let user_home = temp.path().join("user-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&user_home).unwrap();
+        let _env = TestHomeEnvGuard::set(&codex_home, &user_home);
+        let store = SettingsStore::default();
+        let initial = BackendSettings::default();
+        let initial_active_relay_id = initial.active_relay_id.clone();
+        store.save(&initial).unwrap();
+        let requested = BackendSettings {
+            relay_profiles_enabled: true,
+            active_relay_id: "api".to_string(),
+            relay_profiles: vec![RelayProfile {
+                id: "api".to_string(),
+                name: "API".to_string(),
+                relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+                config_contents: "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://queued.example/v1\"\n".to_string(),
+                auth_contents: "{\"OPENAI_API_KEY\":\"sk-test\"}\n".to_string(),
+                ..RelayProfile::default()
+            }],
+            ..BackendSettings::default()
+        };
+        let relay_lock =
+            codex_plus_core::relay_switch::acquire_relay_switch_lock(&codex_home).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let apply = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            tauri::async_runtime::block_on(apply_pure_api_injection(Some(requested)))
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            store.load().unwrap().active_relay_id,
+            initial_active_relay_id
+        );
+        assert!(!codex_home.join("config.toml").exists());
+        drop(relay_lock);
+        let result = apply.join().unwrap();
+        assert_eq!(result.status, "ok");
+        assert_eq!(store.load().unwrap().active_relay_id, "api");
+        assert!(
+            std::fs::read_to_string(codex_home.join("config.toml"))
+                .unwrap()
+                .contains("https://queued.example/v1")
+        );
+    }
+
+    #[test]
+    fn pure_api_apply_rolls_back_supplied_settings_and_live_files_on_failure() {
+        let _lock = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let user_home = temp.path().join("user-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&user_home).unwrap();
+        let _env = TestHomeEnvGuard::set(&codex_home, &user_home);
+        let original_config = "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://before.example/v1\"\n";
+        let original_auth = "{\"OPENAI_API_KEY\":\"sk-before\"}\n";
+        std::fs::write(codex_home.join("config.toml"), original_config).unwrap();
+        std::fs::write(codex_home.join("auth.json"), original_auth).unwrap();
+        let store = SettingsStore::default();
+        let original = BackendSettings {
+            relay_profiles_enabled: true,
+            active_relay_id: "before".to_string(),
+            relay_profiles: vec![RelayProfile {
+                id: "before".to_string(),
+                relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+                config_contents: original_config.to_string(),
+                auth_contents: original_auth.to_string(),
+                ..RelayProfile::default()
+            }],
+            ..BackendSettings::default()
+        };
+        store.save(&original).unwrap();
+        let stored_before = store.load().unwrap();
+        let requested = BackendSettings {
+            relay_profiles_enabled: true,
+            active_relay_id: "broken".to_string(),
+            relay_profiles: vec![
+                original.relay_profiles[0].clone(),
+                RelayProfile {
+                    id: "broken".to_string(),
+                    relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+                    config_contents: "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://broken.example/v1\"\n".to_string(),
+                    auth_contents: "{invalid json".to_string(),
+                    ..RelayProfile::default()
+                },
+            ],
+            ..BackendSettings::default()
+        };
+
+        let result = tauri::async_runtime::block_on(apply_pure_api_injection(Some(requested)));
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(store.load().unwrap(), stored_before);
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            original_config
+        );
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("auth.json")).unwrap(),
+            original_auth
+        );
+    }
+
+    #[test]
+    fn manager_settings_writers_are_serialized_by_the_relay_switch_lock() {
+        let commands =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
+                .unwrap();
+        for (start, end) in [
+            (
+                "pub async fn import_dream_skin_image",
+                "pub async fn reset_dream_skin_image",
+            ),
+            (
+                "pub async fn reset_dream_skin_image",
+                "pub fn list_dream_skin_themes",
+            ),
+            (
+                "pub async fn activate_dream_skin_theme",
+                "pub async fn dream_skin_status",
+            ),
+            (
+                "pub async fn apply_dream_skin",
+                "pub async fn restore_dream_skin",
+            ),
+            (
+                "pub async fn restore_dream_skin",
+                "pub async fn reset_dream_skin_theme",
+            ),
+            (
+                "pub async fn reset_dream_skin_theme",
+                "pub async fn verify_dream_skin",
+            ),
+            (
+                "pub async fn import_ccs_providers",
+                "pub fn load_pending_provider_import",
+            ),
+            (
+                "pub async fn sync_providers_now",
+                "fn is_success_sync_status",
+            ),
+            (
+                "pub async fn reset_settings",
+                "pub async fn reset_image_overlay_settings",
+            ),
+            (
+                "pub async fn reset_image_overlay_settings",
+                "pub fn relay_status",
+            ),
+        ] {
+            let start_index = commands
+                .find(start)
+                .unwrap_or_else(|| panic!("missing {start}"));
+            let end_index = commands[start_index..]
+                .find(end)
+                .map(|offset| start_index + offset)
+                .unwrap_or_else(|| panic!("missing {end}"));
+            assert!(
+                commands[start_index..end_index].contains("acquire_relay_switch_lock"),
+                "{start} must acquire the relay switch lock"
+            );
+        }
+
+        let manager_lib =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
+        let tray_start = manager_lib
+            .find("async fn apply_dream_skin_from_tray")
+            .unwrap();
+        assert!(manager_lib[tray_start..].contains("acquire_relay_switch_lock"));
+
+        let core_routes = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../crates/codex-plus-core/src/routes.rs"
+        ))
+        .unwrap();
+        let settings_impl = core_routes
+            .find("impl BridgeSettingsService for CoreSettingsService")
+            .unwrap();
+        let setter = core_routes[settings_impl..]
+            .find("async fn set_settings")
+            .map(|offset| settings_impl + offset)
+            .unwrap();
+        let setter_end = core_routes[setter..]
+            .find("async fn codex_app_version")
+            .map(|offset| setter + offset)
+            .unwrap();
+        assert!(core_routes[setter..setter_end].contains("acquire_relay_switch_lock"));
+
+        let provider_import = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../crates/codex-plus-core/src/provider_import.rs"
+        ))
+        .unwrap();
+        for (start, end) in [
+            (
+                "pub fn confirm_pending_provider_import()",
+                "pub fn save_pending_provider_import_at",
+            ),
+            (
+                "pub fn import_provider(request",
+                "pub fn import_provider_with_store",
+            ),
+        ] {
+            let start_index = provider_import.find(start).unwrap();
+            let end_index = provider_import[start_index..]
+                .find(end)
+                .map(|offset| start_index + offset)
+                .unwrap();
+            assert!(
+                provider_import[start_index..end_index].contains("acquire_relay_switch_lock"),
+                "{start} must serialize the default settings store"
+            );
+        }
+
+        let sync_start = commands.find("pub async fn sync_providers_now").unwrap();
+        let sync_end = commands[sync_start..]
+            .find("fn is_success_sync_status")
+            .map(|offset| sync_start + offset)
+            .unwrap();
+        let sync_command = &commands[sync_start..sync_end];
+        let lock_index = sync_command.find("acquire_relay_switch_lock").unwrap();
+        let snapshot_index = sync_command
+            .find("prepare_codex_app_state_before_provider_switch")
+            .unwrap();
+        let provider_lock_index = sync_command.find("run_provider_sync_with_target").unwrap();
+        assert!(lock_index < snapshot_index);
+        assert!(snapshot_index < provider_lock_index);
+    }
+
+    #[test]
+    fn reset_settings_waits_for_cross_process_relay_switch_lock() {
+        let _lock = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let user_home = temp.path().join("user-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&user_home).unwrap();
+        let _env = TestHomeEnvGuard::set(&codex_home, &user_home);
+        let store = SettingsStore::default();
+        store
+            .save(&BackendSettings {
+                active_relay_id: "keep-until-unlocked".to_string(),
+                ..BackendSettings::default()
+            })
+            .unwrap();
+        let relay_lock =
+            codex_plus_core::relay_switch::acquire_relay_switch_lock(&codex_home).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            tauri::async_runtime::block_on(reset_settings())
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(store.load().unwrap().active_relay_id, "keep-until-unlocked");
+        drop(relay_lock);
+        let result = reset.join().unwrap();
+        assert_eq!(result.status, "ok");
+        assert_ne!(store.load().unwrap().active_relay_id, "keep-until-unlocked");
+    }
+
+    #[test]
+    fn cleanup_apply_command_uses_effective_home_and_stopped_app_guard() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
+                .unwrap();
+        let start = source
+            .find("pub async fn apply_session_index_cleanup")
+            .unwrap();
+        let end = source[start..]
+            .find("pub async fn sync_providers_now")
+            .map(|offset| start + offset)
+            .unwrap();
+        let command = &source[start..end];
+        assert!(command.contains("default_codex_home_dir"));
+        assert!(command.contains("apply_session_index_cleanup_with_stopped_app_guard"));
+        assert!(!command.contains("apply_session_index_cleanup(None"));
+        let relay_lock = command.find("acquire_relay_switch_lock").unwrap();
+        let cleanup = command
+            .find("apply_session_index_cleanup_with_stopped_app_guard")
+            .unwrap();
+        assert!(relay_lock < cleanup);
     }
 
     #[test]
@@ -4438,7 +5402,7 @@ mod tests {
         let source =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
                 .unwrap();
-        let start = source.find("pub fn reset_dream_skin_theme").unwrap();
+        let start = source.find("pub async fn reset_dream_skin_theme").unwrap();
         let end = source[start..]
             .find("pub async fn verify_dream_skin")
             .unwrap()
@@ -4977,6 +5941,7 @@ mod tests {
 
     #[test]
     fn reset_image_overlay_settings_preserves_supplier_settings() {
+        let _lock = lock_codex_home_for_test();
         let temp = tempfile::tempdir().unwrap();
         let settings_path = temp.path().join("settings.json");
         let previous = codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path));
@@ -4998,7 +5963,7 @@ mod tests {
         };
         SettingsStore::default().save(&settings).unwrap();
 
-        let result = reset_image_overlay_settings();
+        let result = tauri::async_runtime::block_on(reset_image_overlay_settings());
         codex_plus_core::paths::set_settings_path_for_tests(previous);
 
         assert_eq!(result.status, "ok");
@@ -5200,5 +6165,14 @@ model_reasoning_effort = "high"
 
         assert_eq!(result.status, "failed");
         assert!(result.message.contains("只允许打开 http 或 https 链接"));
+    }
+
+    #[test]
+    fn relay_test_status_accepts_only_2xx() {
+        assert!(relay_test_http_status_is_success(200));
+        assert!(relay_test_http_status_is_success(299));
+        assert!(!relay_test_http_status_is_success(300));
+        assert!(!relay_test_http_status_is_success(399));
+        assert!(!relay_test_http_status_is_success(400));
     }
 }

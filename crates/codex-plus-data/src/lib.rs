@@ -9,8 +9,8 @@ pub use provider_sync::{
     ProviderSyncResult, ProviderSyncStatus, ProviderSyncTargetList, ProviderSyncTargetOption,
     ProviderSyncTargetSource, SessionIndexCleanupApplyError, SessionIndexCleanupCandidate,
     SessionIndexCleanupPreview, SessionIndexCleanupResult, apply_session_index_cleanup,
-    load_provider_sync_targets, preview_session_index_cleanup, run_provider_sync,
-    run_provider_sync_with_target,
+    apply_session_index_cleanup_with_stopped_app_guard, load_provider_sync_targets,
+    preview_session_index_cleanup, run_provider_sync, run_provider_sync_with_target,
 };
 pub use storage::{
     LocalSession, SQLiteStorageAdapter, delete_local_from_paths,

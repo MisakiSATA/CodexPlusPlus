@@ -35,20 +35,50 @@ pub(super) fn persist_profile_fields(raw: &mut Map<String, Value>, profiles: &[R
         else {
             continue;
         };
-        if let Some(config_contents) = raw_profile.get("configContents").and_then(Value::as_str) {
-            let (profile_config, _) = split_sections(config_contents);
-            raw_profile.insert("configContents".to_string(), Value::String(profile_config));
-        }
-        raw_profile.insert(
-            "contextSelection".to_string(),
-            serde_json::to_value(&profile.context_selection)
-                .unwrap_or_else(|_| Value::Object(Map::new())),
-        );
-        raw_profile.insert(
-            "contextSelectionInitialized".to_string(),
-            Value::Bool(profile.context_selection_initialized),
-        );
+        persist_profile_fields_for_profile(raw_profile, profile);
     }
+}
+
+pub(super) fn persist_profile_fields_for_id(
+    raw: &mut Map<String, Value>,
+    profiles: &[RelayProfile],
+    profile_id: &str,
+) {
+    let Some(raw_profile) = raw
+        .get_mut("relayProfiles")
+        .and_then(Value::as_array_mut)
+        .and_then(|profiles| {
+            profiles
+                .iter_mut()
+                .find(|profile| profile.get("id").and_then(Value::as_str) == Some(profile_id))
+        })
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(profile) = profiles.iter().find(|profile| profile.id == profile_id) else {
+        return;
+    };
+    persist_profile_fields_for_profile(raw_profile, profile);
+}
+
+fn persist_profile_fields_for_profile(
+    raw_profile: &mut Map<String, Value>,
+    profile: &RelayProfile,
+) {
+    if let Some(config_contents) = raw_profile.get("configContents").and_then(Value::as_str) {
+        let (profile_config, _) = split_sections(config_contents);
+        raw_profile.insert("configContents".to_string(), Value::String(profile_config));
+    }
+    raw_profile.insert(
+        "contextSelection".to_string(),
+        serde_json::to_value(&profile.context_selection)
+            .unwrap_or_else(|_| Value::Object(Map::new())),
+    );
+    raw_profile.insert(
+        "contextSelectionInitialized".to_string(),
+        Value::Bool(profile.context_selection_initialized),
+    );
 }
 
 fn sync_profile_selections(settings: &mut BackendSettings, context: &str) {

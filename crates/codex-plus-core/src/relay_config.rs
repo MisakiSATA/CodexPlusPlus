@@ -3,7 +3,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 use crate::settings::{RelayContextSelection, RelayProfile, RelayProtocol};
@@ -11,6 +11,8 @@ use crate::settings::{RelayContextSelection, RelayProfile, RelayProtocol};
 const RELAY_PROVIDER: &str = "custom";
 const LEGACY_RELAY_PROVIDERS: &[&str] = &["CodexPlusPlus", "CodexPP"];
 const CHAT_UPSTREAM_BASE_URL_KEY: &str = "codex_plus_chat_base_url";
+const RELAY_TEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const RELAY_TEST_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const RESERVED_MODEL_PROVIDER_IDS: &[&str] = &[
     "amazon-bedrock",
     "openai",
@@ -379,8 +381,14 @@ pub fn apply_relay_profile_files_to_home_with_context(
         &profile.context_window,
         &profile.auto_compact_limit,
     )?;
-    let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
-    apply_relay_files_to_home(home, &config_with_catalog, &profile.auth_contents)
+    apply_relay_profile_with_model_catalog_transaction(
+        home,
+        profile,
+        &config_with_limits,
+        |config_with_catalog| {
+            apply_relay_files_to_home(home, config_with_catalog, &profile.auth_contents)
+        },
+    )
 }
 
 pub fn apply_relay_profile_to_home_with_switch_rules(
@@ -416,24 +424,29 @@ pub fn apply_relay_profile_to_home_with_switch_rules_and_computer_use_guard(
         &profile.context_window,
         &profile.auto_compact_limit,
     )?;
-    let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
-
-    if profile.relay_mode == crate::settings::RelayMode::PureApi {
-        apply_relay_files_to_home_with_computer_use_guard(
-            home,
-            &config_with_catalog,
-            &profile.auth_contents,
-            preserve_computer_use_guard,
-        )
-    } else {
-        let auth_contents = official_profile_auth_for_switch(home, &profile.auth_contents)?;
-        apply_relay_files_to_home_with_computer_use_guard(
-            home,
-            &config_with_catalog,
-            &auth_contents,
-            preserve_computer_use_guard,
-        )
-    }
+    apply_relay_profile_with_model_catalog_transaction(
+        home,
+        profile,
+        &config_with_limits,
+        |config_with_catalog| {
+            if profile.relay_mode == crate::settings::RelayMode::PureApi {
+                apply_relay_files_to_home_with_computer_use_guard(
+                    home,
+                    config_with_catalog,
+                    &profile.auth_contents,
+                    preserve_computer_use_guard,
+                )
+            } else {
+                let auth_contents = official_profile_auth_for_switch(home, &profile.auth_contents)?;
+                apply_relay_files_to_home_with_computer_use_guard(
+                    home,
+                    config_with_catalog,
+                    &auth_contents,
+                    preserve_computer_use_guard,
+                )
+            }
+        },
+    )
 }
 
 pub fn apply_relay_profile_config_to_home_with_context(
@@ -453,8 +466,47 @@ pub fn apply_relay_profile_config_to_home_with_context(
         &profile.context_window,
         &profile.auto_compact_limit,
     )?;
-    let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
-    apply_relay_config_file_to_home(home, &config_with_catalog)
+    apply_relay_profile_with_model_catalog_transaction(
+        home,
+        profile,
+        &config_with_limits,
+        |config_with_catalog| apply_relay_config_file_to_home(home, config_with_catalog),
+    )
+}
+
+fn apply_relay_profile_with_model_catalog_transaction(
+    home: &Path,
+    profile: &RelayProfile,
+    config_text: &str,
+    apply_config: impl FnOnce(&str) -> anyhow::Result<RelayApplyResult>,
+) -> anyhow::Result<RelayApplyResult> {
+    let catalog_path = managed_model_catalog_path(home, &profile.id);
+    let old_catalog = read_optional_bytes(&catalog_path).with_context(|| {
+        format!(
+            "读取模型 catalog 快照失败：{}",
+            catalog_path.to_string_lossy()
+        )
+    })?;
+    let apply_result = (|| {
+        let config_with_catalog = apply_model_catalog_to_config(home, profile, config_text)?;
+        apply_config(&config_with_catalog)
+    })();
+
+    match apply_result {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            if let Err(rollback_error) =
+                restore_optional_file(&catalog_path, old_catalog.as_deref()).with_context(|| {
+                    format!("恢复模型 catalog 失败：{}", catalog_path.to_string_lossy())
+                })
+            {
+                anyhow::bail!(
+                    "应用供应商配置失败：{error:#}；同时回滚模型 catalog 失败：{rollback_error:#}"
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 pub fn apply_relay_config_file_to_home(
@@ -513,6 +565,21 @@ pub async fn test_relay_profile(
     profile: &RelayProfile,
     model: &str,
 ) -> anyhow::Result<RelayProfileTestResult> {
+    test_relay_profile_with_timeouts(
+        profile,
+        model,
+        RELAY_TEST_CONNECT_TIMEOUT,
+        RELAY_TEST_TOTAL_TIMEOUT,
+    )
+    .await
+}
+
+async fn test_relay_profile_with_timeouts(
+    profile: &RelayProfile,
+    model: &str,
+    connect_timeout: Duration,
+    total_timeout: Duration,
+) -> anyhow::Result<RelayProfileTestResult> {
     let base_url = relay_profile_base_url(profile);
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
@@ -524,10 +591,14 @@ pub async fn test_relay_profile(
         anyhow::bail!("API Key 不能为空");
     }
 
-    let client = crate::http_client::proxied_client("CodexPlusPlus/RelayTest")?;
+    let client = reqwest::Client::builder()
+        .user_agent("CodexPlusPlus/RelayTest")
+        .connect_timeout(connect_timeout)
+        .timeout(total_timeout)
+        .build()?;
     let endpoint = match profile.protocol {
         RelayProtocol::Responses => format!("{base_url}/responses"),
-        RelayProtocol::ChatCompletions => format!("{base_url}/chat/completions"),
+        RelayProtocol::ChatCompletions => crate::protocol_proxy::chat_completions_url(base_url),
     };
     let test_model = model.trim();
     if test_model.is_empty() {
@@ -543,43 +614,72 @@ pub async fn test_relay_profile(
         .send()
         .await?;
     let http_status = response.status().as_u16();
-
-    // 如果 404 且 base_url 末尾没有 /v1，尝试自动补 /v1 后再发一次。
-    // 许多上游（中转站、自建代理）暴露的路径以 /v1/ 开头，
-    // 用户容易遗漏这个前缀，导致 /responses 或 /chat/completions 404。
-    if http_status == 404 && !base_url.ends_with("/v1") {
-        let v1_url = format!("{base_url}/v1");
-        let v1_endpoint = match profile.protocol {
-            RelayProtocol::Responses => format!("{v1_url}/responses"),
-            RelayProtocol::ChatCompletions => format!("{v1_url}/chat/completions"),
-        };
-        let v1_response = client
-            .post(&v1_endpoint)
-            .bearer_auth(api_key)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&payload)
-            .send()
-            .await?;
-        let v1_status = v1_response.status().as_u16();
-        if v1_status < 400 {
-            let response_text = v1_response.text().await.unwrap_or_default();
-            return Ok(RelayProfileTestResult {
-                http_status: v1_status,
-                endpoint: v1_endpoint,
-                response_preview: format!(
-                    "（Base URL 建议加上 /v1 前缀）{}",
-                    response_text.chars().take(280).collect::<String>()
-                ),
-            });
-        }
-    }
-
     let response_text = response.text().await.unwrap_or_default();
+    if (200..300).contains(&http_status) {
+        let response_json: Value = serde_json::from_str(&response_text)
+            .context("供应商测试返回的 2xx 响应不是有效 JSON")?;
+        // Responses 协议的正常回包会带 "error": null，只有非 null 才算上游报错
+        if let Some(error) = response_json.get("error") {
+            if !error.is_null() {
+                anyhow::bail!("供应商测试返回顶层 error：{error}");
+            }
+        }
+        validate_relay_test_response_structure(profile.protocol, &response_json)?;
+    }
     Ok(RelayProfileTestResult {
         http_status,
         endpoint,
         response_preview: response_text.chars().take(320).collect(),
     })
+}
+
+/// 2xx 不代表协议成功：部分网关会用 200 包 `{}`、`{"ok":true}`、`{"success":false}`。
+/// 按协议校验结构，避免连接测试误标绿。
+fn validate_relay_test_response_structure(
+    protocol: RelayProtocol,
+    response_json: &Value,
+) -> anyhow::Result<()> {
+    match protocol {
+        RelayProtocol::Responses => {
+            let has_output_items = response_json
+                .get("output")
+                .and_then(Value::as_array)
+                .is_some_and(|output| !output.is_empty());
+            let has_output_text = response_json
+                .get("output_text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty());
+            if !has_output_items && !has_output_text {
+                anyhow::bail!(
+                    "供应商测试返回 2xx，但响应缺少 Responses 协议的 output 内容，疑似网关包装体"
+                );
+            }
+        }
+        RelayProtocol::ChatCompletions => {
+            let choices = response_json
+                .get("choices")
+                .and_then(Value::as_array)
+                .filter(|choices| !choices.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("供应商测试返回 2xx，但响应缺少非空 choices，疑似网关包装体")
+                })?;
+            let first = &choices[0];
+            let has_content = first
+                .get("message")
+                .map(|message| {
+                    message
+                        .get("content")
+                        .is_some_and(|content| !content.is_null())
+                })
+                .unwrap_or(false)
+                || first.get("text").is_some_and(|text| !text.is_null())
+                || first.get("delta").is_some();
+            if !has_content {
+                anyhow::bail!("供应商测试返回 2xx，但 choices 里没有可提取的消息内容");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn relay_profile_test_payload(protocol: RelayProtocol, model: &str) -> Value {
@@ -624,6 +724,26 @@ pub fn clear_relay_config_to_home_with_auth_and_computer_use_guard(
     auth_contents: Option<&str>,
     preserve_computer_use_guard: bool,
 ) -> anyhow::Result<RelayApplyResult> {
+    clear_relay_config_to_home_inner(home, auth_contents, preserve_computer_use_guard, false)
+}
+
+/// 供应商切换到纯官方 profile 时使用：除标准清理外，若原 config 是第三方渠道写入的
+/// （根级声明了 model_provider），还要一并清掉该渠道遗留的 model 与上下文键，
+/// 避免官方 OpenAI 渠道继续指向 claude / grok 等第三方模型。
+pub fn clear_relay_config_for_official_switch(
+    home: &Path,
+    auth_contents: Option<&str>,
+    preserve_computer_use_guard: bool,
+) -> anyhow::Result<RelayApplyResult> {
+    clear_relay_config_to_home_inner(home, auth_contents, preserve_computer_use_guard, true)
+}
+
+fn clear_relay_config_to_home_inner(
+    home: &Path,
+    auth_contents: Option<&str>,
+    preserve_computer_use_guard: bool,
+    drop_relay_model_residue: bool,
+) -> anyhow::Result<RelayApplyResult> {
     std::fs::create_dir_all(home)?;
     let auth_bytes = match auth_contents {
         Some(contents) if !contents.trim().is_empty() => Some(contents.as_bytes().to_vec()),
@@ -631,6 +751,7 @@ pub fn clear_relay_config_to_home_with_auth_and_computer_use_guard(
     };
     let config_path = home.join("config.toml");
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let leaving_relay_channel = root_key_string(&existing, "model_provider").is_some();
     let mut without_tables = remove_table(&existing, &format!("model_providers.{RELAY_PROVIDER}"));
     for legacy_provider in LEGACY_RELAY_PROVIDERS {
         without_tables = remove_table(
@@ -646,6 +767,15 @@ pub fn clear_relay_config_to_home_with_auth_and_computer_use_guard(
         "base_url",
     ] {
         updated = remove_root_key(&updated, key);
+    }
+    if drop_relay_model_residue && leaving_relay_channel {
+        for key in [
+            "model",
+            "model_context_window",
+            "model_auto_compact_token_limit",
+        ] {
+            updated = remove_root_key(&updated, key);
+        }
     }
     let backup_path = write_codex_live_atomic(
         home,
@@ -713,6 +843,20 @@ pub fn backfill_relay_profile_from_home_with_common(
     };
     profile.config_contents =
         restore_profile_provider_id_for_backfill(&profile.config_contents, &template_config)?;
+    if profile.protocol == RelayProtocol::ChatCompletions {
+        if let Some(live_base_url) =
+            provider_string_from_config(&profile.config_contents, "base_url").filter(|value| {
+                !value.trim().is_empty()
+                    && !is_local_protocol_proxy_base_url(
+                        value,
+                        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                    )
+            })
+        {
+            profile.upstream_base_url = live_base_url.clone();
+            profile.base_url = live_base_url;
+        }
+    }
     if profile.protocol == RelayProtocol::Responses
         && provider_string_from_config(&profile.config_contents, "base_url").as_deref()
             == Some(
@@ -1514,17 +1658,13 @@ fn apply_model_catalog_to_config(
         "model-catalogs/{}.json",
         sanitize_catalog_filename(&profile.id)
     );
-    // 用户已手写 model_catalog_json 指针时保留，不覆盖（保 preserves_user_model_catalog_json 测试）
-    // 仅当现有指针指向本 profile 自己生成的 catalog 时才重新生成。
-    if let Some(existing) = root_key_string(config_text, "model_catalog_json") {
-        if existing != catalog_relative {
-            return Ok(config_text.to_string());
+    let mut config_text = config_text.to_string();
+    // 真正的外部 catalog 由用户管理；Codex++ managed 指针必须按目标 profile 重新计算。
+    if let Some(existing) = root_key_string(&config_text, "model_catalog_json") {
+        if !is_codex_plus_managed_model_catalog(home, &existing) {
+            return Ok(config_text);
         }
-    }
-    if let Some(external_catalog) = live_external_model_catalog(home) {
-        let mut doc = parse_toml_document(config_text)?;
-        doc["model_catalog_json"] = toml_edit::value(external_catalog);
-        return Ok(normalize_optional_toml(doc));
+        config_text = remove_root_key(&config_text, "model_catalog_json");
     }
     let (model_list, model_windows): (String, std::collections::HashMap<String, String>) =
         if profile.model_windows.trim().is_empty() && profile.model_list.contains('[') {
@@ -1540,16 +1680,21 @@ fn apply_model_catalog_to_config(
     // Always generate catalog for custom models to support arbitrary model names.
     // Skip only when no models are defined at all.
     if entries.is_empty() {
-        return Ok(config_text.to_string());
+        if let Some(external_catalog) = live_external_model_catalog(home) {
+            let mut doc = parse_toml_document(&config_text)?;
+            doc["model_catalog_json"] = toml_edit::value(external_catalog);
+            return Ok(normalize_optional_toml(doc));
+        }
+        return Ok(config_text);
     }
     let fallback = parse_optional_positive_u64(&profile.context_window, "上下文大小")?;
-    let catalog_path = home.join(&catalog_relative);
+    let catalog_path = managed_model_catalog_path(home, &profile.id);
     if let Some(parent) = catalog_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let catalog_json = crate::model_suffix::build_model_catalog_json(&entries, fallback);
-    std::fs::write(&catalog_path, catalog_json)?;
-    let mut doc = parse_toml_document(config_text)?;
+    crate::settings::atomic_write(&catalog_path, catalog_json.as_bytes())?;
+    let mut doc = parse_toml_document(&config_text)?;
     doc["model_catalog_json"] = toml_edit::value(catalog_relative);
     Ok(normalize_optional_toml(doc))
 }
@@ -1565,12 +1710,6 @@ fn is_codex_plus_managed_model_catalog(home: &Path, path: &str) -> bool {
     let normalized = path.trim().replace('\\', "/");
     let relative = normalized.trim_start_matches("./");
     if relative.to_ascii_lowercase().starts_with("model-catalogs/") {
-        return true;
-    }
-    let normalized_lower = normalized.to_ascii_lowercase();
-    if normalized_lower.contains("/model-catalogs/")
-        || normalized_lower.ends_with("/model-catalogs")
-    {
         return true;
     }
     let managed_root = home
@@ -1598,6 +1737,11 @@ fn sanitize_catalog_filename(id: &str) -> String {
             }
         })
         .collect()
+}
+
+pub(crate) fn managed_model_catalog_path(home: &Path, profile_id: &str) -> PathBuf {
+    home.join("model-catalogs")
+        .join(format!("{}.json", sanitize_catalog_filename(profile_id)))
 }
 
 fn sync_context_limits_from_config(profile: &mut RelayProfile, config_text: &str) {
@@ -2016,10 +2160,10 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_default();
     if profile.protocol == RelayProtocol::ChatCompletions
-        && provider_base_url
-            == crate::protocol_proxy::local_responses_proxy_base_url(
-                crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-            )
+        && is_local_protocol_proxy_base_url(
+            &provider_base_url,
+            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        )
     {
         String::new()
     } else if !provider_base_url.is_empty() {
@@ -2027,6 +2171,31 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
     } else {
         profile.base_url.trim().to_string()
     }
+}
+
+fn is_local_protocol_proxy_base_url(value: &str, port: u16) -> bool {
+    let Ok(url) = reqwest::Url::parse(value.trim()) else {
+        return false;
+    };
+    if url.scheme() != "http"
+        || url.port_or_known_default() != Some(port)
+        || url.path().trim_end_matches('/') != "/v1"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
 }
 
 pub fn relay_profile_api_key(profile: &RelayProfile) -> String {
@@ -2093,11 +2262,12 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["name"] = toml_edit::value(provider_id.as_str());
     }
-    if provider
-        .get("wire_api")
-        .and_then(Item::as_str)
-        .map(str::trim)
-        .is_none_or(str::is_empty)
+    if profile.protocol == crate::settings::RelayProtocol::ChatCompletions
+        || provider
+            .get("wire_api")
+            .and_then(Item::as_str)
+            .map(str::trim)
+            .is_none_or(str::is_empty)
     {
         provider["wire_api"] = toml_edit::value("responses");
     }
@@ -2549,6 +2719,45 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn relay_profile_test_times_out_when_upstream_never_responds() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 2048];
+            let _ = stream.read(&mut buffer).await;
+            std::future::pending::<()>().await;
+        });
+        let profile = RelayProfile {
+            base_url: format!("http://{address}"),
+            protocol: crate::settings::RelayProtocol::Responses,
+            relay_mode: crate::settings::RelayMode::PureApi,
+            auth_contents: r#"{"OPENAI_API_KEY":"sk-test"}"#.to_string(),
+            ..RelayProfile::default()
+        };
+
+        let error = test_relay_profile_with_timeouts(
+            &profile,
+            "claude-sonnet-4",
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .expect_err("stalled diagnostic request must time out");
+        server.abort();
+
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+        }));
+    }
 
     #[test]
     fn backfill_relay_profile_from_home_with_common_restores_template_provider_id() {

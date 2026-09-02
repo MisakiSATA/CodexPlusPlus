@@ -15,6 +15,14 @@ const OPENAI_CURATED_REMOTE_MARKETPLACE_ZIP: &[u8] =
     include_bytes!("../../../assets/plugin-marketplaces/openai-curated-remote.zip");
 
 pub fn ensure_openai_curated_marketplace_config(home: &Path) -> anyhow::Result<bool> {
+    let relay_switch_lock = crate::relay_switch::acquire_relay_switch_lock(home)?;
+    ensure_openai_curated_marketplace_config_with_lock(home, &relay_switch_lock)
+}
+
+pub fn ensure_openai_curated_marketplace_config_with_lock(
+    home: &Path,
+    relay_switch_lock: &crate::relay_switch::RelaySwitchLockGuard,
+) -> anyhow::Result<bool> {
     let Some(marketplace_root) = local_openai_curated_marketplace_root(home)? else {
         return Ok(false);
     };
@@ -22,18 +30,28 @@ pub fn ensure_openai_curated_marketplace_config(home: &Path) -> anyhow::Result<b
         home,
         &[OPENAI_CURATED_MARKETPLACE, OPENAI_API_CURATED_MARKETPLACE],
         &marketplace_root,
+        relay_switch_lock,
     )?;
     if let Some(remote_marketplace_root) = local_openai_curated_remote_marketplace_root(home)? {
         changed |= ensure_marketplace_configs(
             home,
             &[OPENAI_CURATED_REMOTE_MARKETPLACE],
             &remote_marketplace_root,
+            relay_switch_lock,
         )?;
     }
     Ok(changed)
 }
 
 pub fn ensure_openai_curated_remote_marketplace_config(home: &Path) -> anyhow::Result<bool> {
+    let relay_switch_lock = crate::relay_switch::acquire_relay_switch_lock(home)?;
+    ensure_openai_curated_remote_marketplace_config_with_lock(home, &relay_switch_lock)
+}
+
+pub fn ensure_openai_curated_remote_marketplace_config_with_lock(
+    home: &Path,
+    relay_switch_lock: &crate::relay_switch::RelaySwitchLockGuard,
+) -> anyhow::Result<bool> {
     let Some(marketplace_root) = local_openai_curated_remote_marketplace_root(home)? else {
         return Ok(false);
     };
@@ -41,10 +59,19 @@ pub fn ensure_openai_curated_remote_marketplace_config(home: &Path) -> anyhow::R
         home,
         &[OPENAI_CURATED_REMOTE_MARKETPLACE],
         &marketplace_root,
+        relay_switch_lock,
     )
 }
 
 pub fn ensure_role_specific_plugins_marketplace_config(home: &Path) -> anyhow::Result<bool> {
+    let relay_switch_lock = crate::relay_switch::acquire_relay_switch_lock(home)?;
+    ensure_role_specific_plugins_marketplace_config_with_lock(home, &relay_switch_lock)
+}
+
+pub fn ensure_role_specific_plugins_marketplace_config_with_lock(
+    home: &Path,
+    relay_switch_lock: &crate::relay_switch::RelaySwitchLockGuard,
+) -> anyhow::Result<bool> {
     let Some(marketplace_root) = local_role_specific_plugins_marketplace_root(home)? else {
         return Ok(false);
     };
@@ -58,6 +85,7 @@ pub fn ensure_role_specific_plugins_marketplace_config(home: &Path) -> anyhow::R
         &[ROLE_SPECIFIC_PLUGINS_MARKETPLACE],
         &marketplace_root,
         &plugin_ids,
+        relay_switch_lock,
     )
 }
 
@@ -154,7 +182,8 @@ pub async fn initialize_openai_curated_marketplace_and_configure(
         initialize_openai_curated_marketplace_from_github(home).await?;
         initialized = true;
     }
-    let configured = ensure_openai_curated_marketplace_config(home)?;
+    let relay_switch_lock = crate::relay_switch::acquire_relay_switch_lock_async(home).await?;
+    let configured = ensure_openai_curated_marketplace_config_with_lock(home, &relay_switch_lock)?;
     Ok(MarketplaceEnsureResult {
         initialized,
         configured,
@@ -598,8 +627,15 @@ fn ensure_marketplace_configs(
     home: &Path,
     marketplace_names: &[&str],
     marketplace_root: &Path,
+    relay_switch_lock: &crate::relay_switch::RelaySwitchLockGuard,
 ) -> anyhow::Result<bool> {
-    ensure_marketplace_configs_with_plugins(home, marketplace_names, marketplace_root, &[])
+    ensure_marketplace_configs_with_plugins(
+        home,
+        marketplace_names,
+        marketplace_root,
+        &[],
+        relay_switch_lock,
+    )
 }
 
 fn ensure_marketplace_configs_with_plugins(
@@ -607,6 +643,7 @@ fn ensure_marketplace_configs_with_plugins(
     marketplace_names: &[&str],
     marketplace_root: &Path,
     plugin_ids: &[String],
+    _relay_switch_lock: &crate::relay_switch::RelaySwitchLockGuard,
 ) -> anyhow::Result<bool> {
     let config_path = home.join("config.toml");
     let existing = match std::fs::read(&config_path) {
@@ -807,6 +844,91 @@ mod tests {
     }
 
     #[test]
+    fn marketplace_config_write_waits_for_relay_switch_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        write_marketplace(&home);
+        std::fs::write(home.join("config.toml"), "model = \"before\"\n").unwrap();
+        let relay_lock = crate::relay_switch::acquire_relay_switch_lock(&home).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let repair_home = home.clone();
+        let repair = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(ensure_openai_curated_marketplace_config(&repair_home))
+                .unwrap();
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "marketplace config repair must wait for the relay switch lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).unwrap(),
+            "model = \"before\"\n"
+        );
+
+        drop(relay_lock);
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+        );
+        repair.join().unwrap();
+    }
+
+    #[test]
+    fn embedded_marketplace_extracts_before_waiting_to_write_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let relay_lock = crate::relay_switch::acquire_relay_switch_lock(&home).unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let repair_home = home.clone();
+        let repair = std::thread::spawn(move || {
+            finished_tx
+                .send(ensure_openai_curated_remote_marketplace_available(
+                    &repair_home,
+                ))
+                .unwrap();
+        });
+        let marketplace_manifest = home
+            .join(".tmp")
+            .join("plugins-remote")
+            .join(".agents")
+            .join("plugins")
+            .join("marketplace.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !marketplace_manifest.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(marketplace_manifest.is_file());
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "config registration must remain blocked after lock-free extraction"
+        );
+        assert!(!home.join("config.toml").exists());
+
+        drop(relay_lock);
+        let result = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        repair.join().unwrap();
+        assert!(result.initialized);
+        assert!(result.configured);
+    }
+
+    #[test]
     fn ensure_openai_curated_marketplace_config_registers_local_marketplace() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();
@@ -953,7 +1075,14 @@ mod tests {
         let root = home.join(".tmp").join("plugins");
         write_marketplace(home);
         write_remote_marketplace(home);
-        ensure_marketplace_configs(home, &[OPENAI_CURATED_MARKETPLACE], &root).unwrap();
+        let relay_switch_lock = crate::relay_switch::acquire_relay_switch_lock(home).unwrap();
+        ensure_marketplace_configs(
+            home,
+            &[OPENAI_CURATED_MARKETPLACE],
+            &root,
+            &relay_switch_lock,
+        )
+        .unwrap();
 
         let status = openai_curated_marketplace_status(home);
 

@@ -173,15 +173,83 @@ fn github_release_workflow_uploads_static_latest_json() {
 }
 
 #[test]
-fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
+fn relay_settings_switches_profile_and_live_files_in_one_backend_transaction() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
     let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
     let commands_rs = manifest_dir.join("src/commands.rs");
     let commands_rs = std::fs::read_to_string(&commands_rs).expect("read manager commands.rs");
+    let relay_switch_rs = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .unwrap()
+        .join("crates/codex-plus-core/src/relay_switch.rs");
+    let relay_switch_rs =
+        std::fs::read_to_string(&relay_switch_rs).expect("read core relay_switch.rs");
 
-    assert!(app_tsx.contains("snapshotActiveRelayFilesBeforeSwitch"));
-    assert!(app_tsx.contains("backfill_relay_profile_from_live"));
+    let frontend_switch_start = app_tsx
+        .find("  const switchRelayProfile = async")
+        .expect("find frontend relay switch");
+    let frontend_switch_end = app_tsx[frontend_switch_start..]
+        .find("  const copyText = async")
+        .map(|offset| frontend_switch_start + offset)
+        .expect("find end of frontend relay switch");
+    let frontend_switch = &app_tsx[frontend_switch_start..frontend_switch_end];
+    assert!(frontend_switch.contains("call<RelaySwitchResult>(\"switch_relay_profile\""));
+    assert!(
+        frontend_switch.contains("request: { settings: switchSettings, previousActiveRelayId }")
+    );
+    assert!(!frontend_switch.contains("saveRelayFile"));
+    assert!(!frontend_switch.contains("save_relay_file"));
+    assert!(!frontend_switch.contains("backfill_relay_profile_from_live"));
+
+    let save_draft_start = app_tsx
+        .find("  const saveDraft = async () => {")
+        .expect("find relay profile save flow");
+    let save_draft_end = app_tsx[save_draft_start..]
+        .find("  const switchDraft = () => {")
+        .map(|offset| save_draft_start + offset)
+        .expect("find end of relay profile save flow");
+    let save_draft = &app_tsx[save_draft_start..save_draft_end];
+    assert!(save_draft.contains("isActive && form.relayProfilesEnabled"));
+    assert!(save_draft.contains("await actions.switchRelayProfile(next, form.activeRelayId)"));
+    assert!(!save_draft.contains("saveRelayFile"));
+
+    let command_start = commands_rs
+        .find("pub fn switch_relay_profile(")
+        .expect("find manager relay switch command");
+    let command_end = commands_rs[command_start..]
+        .find("pub fn write_diagnostic_event(")
+        .map(|offset| command_start + offset)
+        .expect("find end of manager relay switch command");
+    let switch_command = &commands_rs[command_start..command_end];
+    assert!(switch_command.contains("request.previous_active_relay_id"));
+    assert!(switch_command.contains("request.settings"));
+    assert!(switch_command.contains("switch_relay_profile_in_home("));
+    assert!(!switch_command.contains("apply_relay_profile_to_home_with_switch_rules"));
+    assert!(!switch_command.contains("save_relay_file"));
+
+    let transaction_start = relay_switch_rs
+        .find("pub fn switch_relay_profile_in_home_with_lock(")
+        .expect("find core relay switch transaction");
+    let transaction_end = relay_switch_rs[transaction_start..]
+        .find("struct LiveFilesSnapshot")
+        .map(|offset| transaction_start + offset)
+        .expect("find end of core relay switch transaction");
+    let transaction = &relay_switch_rs[transaction_start..transaction_end];
+    let snapshot = transaction.find("LiveFilesSnapshot::capture").unwrap();
+    let backfill = transaction.find("backfill_profile_before_switch").unwrap();
+    let save = transaction.find(".save(&selected_settings)").unwrap();
+    let apply = transaction.find("apply_selected_relay_profile").unwrap();
+    let settings_restore = transaction.find(".save(&original_settings)").unwrap();
+    let live_restore = transaction.find("live_snapshot.restore(home)").unwrap();
+    assert!(snapshot < backfill);
+    assert!(backfill < save);
+    assert!(save < apply);
+    assert!(apply < settings_restore);
+    assert!(settings_restore < live_restore);
+
     assert!(app_tsx.contains("relayProfileSwitchValidation(selectedBeforeSave)"));
     assert!(app_tsx.contains("缺少独立 config.toml"));
     assert!(app_tsx.contains("const command = relayProfileSwitchCommand(selectedAfterSave)"));
@@ -192,8 +260,6 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
     assert!(app_tsx.contains("onClick={createNewAggregateProfile}"));
     assert!(app_tsx.contains("已打开聚合供应商详情"));
     assert!(!commands_rs.contains("缺少独立 auth.json"));
-    assert!(commands_rs.contains("backfill_relay_profile_from_live"));
-    assert!(commands_rs.contains("apply_relay_profile_to_home_with_switch_rules"));
 }
 
 #[test]

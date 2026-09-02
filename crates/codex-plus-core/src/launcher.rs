@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -146,8 +147,15 @@ impl LaunchHandle {
     }
 }
 
+/// 启动阶段注入重试的总时长上限。页面 30 秒未就绪后注入重试是延长的就绪探测，
+/// 但它可能在持有供应商切换锁的失败路径上运行，必须限时结束。
+pub const STARTUP_INJECTION_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(90);
+
 #[async_trait(?Send)]
 pub trait LaunchHooks: Send + Sync {
+    fn resolve_codex_home(&self) -> PathBuf {
+        crate::relay_config::default_codex_home_dir()
+    }
     fn resolve_app_dir(
         &self,
         app_dir: Option<&Path>,
@@ -156,8 +164,12 @@ pub trait LaunchHooks: Send + Sync {
     fn select_debug_port(&self, requested: u16) -> u16;
     fn select_helper_port(&self, requested: u16) -> u16;
     async fn load_settings(&self) -> anyhow::Result<BackendSettings>;
-    async fn run_provider_sync(&self) -> anyhow::Result<()>;
-    async fn apply_active_relay_profile(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
+    async fn run_provider_sync(&self, codex_home: &Path) -> anyhow::Result<()>;
+    async fn apply_active_relay_profile(
+        &self,
+        _settings: &BackendSettings,
+        _codex_home: &Path,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
     async fn ensure_computer_use_config(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
@@ -166,8 +178,30 @@ pub trait LaunchHooks: Send + Sync {
     async fn ensure_plugin_marketplace_config(
         &self,
         _settings: &BackendSettings,
+        _relay_switch_lock: &crate::relay_switch::RelaySwitchLockGuard,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+    fn sync_dream_skin_base_theme(&self, settings: &BackendSettings) -> anyhow::Result<()> {
+        crate::dream_skin::sync_default_dream_skin_base_theme(
+            settings.enhancements_enabled
+                && settings.codex_app_dream_skin_enabled
+                && !settings.codex_app_dream_skin_paused,
+            &settings.codex_app_dream_skin_theme_config,
+        )
+    }
+    fn sanitize_historical_model_suffixes(
+        &self,
+        codex_home: &Path,
+    ) -> anyhow::Result<crate::codex_sqlite::SanitizeModelSuffixResult> {
+        crate::codex_sqlite::sanitize_historical_model_suffixes(codex_home)
+    }
+    async fn sanitize_local_storage_model_suffixes(&self, debug_port: u16) {
+        crate::codex_local_storage::sanitize_local_storage_model_suffixes_nonfatal(debug_port)
+            .await;
+    }
+    async fn wait_for_codex_config_load(&self, debug_port: u16) -> anyhow::Result<()> {
+        wait_for_codex_page(debug_port).await
     }
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
     async fn launch_codex(
@@ -194,7 +228,12 @@ pub trait LaunchHooks: Send + Sync {
         self.inject(debug_port, helper_port).await
     }
     async fn ensure_injection(&self, debug_port: u16, helper_port: u16, app_dir: &Path) -> bool {
-        for attempt in 1..=120 {
+        // CDP 端口一直不可达时必须限时放弃：这段循环可能在启动失败路径上
+        // 持有供应商切换锁运行，无界重试会把 Manager 的切换/保存拖住几十分钟。
+        let deadline = std::time::Instant::now() + STARTUP_INJECTION_RETRY_WINDOW;
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
             let result = match self.bridge_context(debug_port, app_dir).await {
                 Ok(Some(ctx)) => self.inject_bridge(debug_port, helper_port, ctx).await,
                 Ok(None) => self.inject(debug_port, helper_port).await,
@@ -212,11 +251,22 @@ pub trait LaunchHooks: Send + Sync {
                             "message": error.to_string()
                         }),
                     );
+                    if std::time::Instant::now() >= deadline {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.ensure_injection_gave_up",
+                            serde_json::json!({
+                                "debug_port": debug_port,
+                                "helper_port": helper_port,
+                                "attempts": attempt,
+                                "window_secs": STARTUP_INJECTION_RETRY_WINDOW.as_secs()
+                            }),
+                        );
+                        return false;
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
         }
-        false
     }
     async fn start_bridge_watchdog(
         &self,
@@ -234,7 +284,7 @@ pub trait LaunchHooks: Send + Sync {
     async fn write_status(&self, status: &str);
     async fn wait_for_codex_exit(&self, launch: &CodexLaunch) -> anyhow::Result<()>;
     async fn shutdown_helper(&self, helper_port: u16);
-    async fn terminate_codex(&self, launch: &CodexLaunch);
+    async fn terminate_codex(&self, launch: &CodexLaunch) -> anyhow::Result<()>;
 }
 
 #[derive(Default)]
@@ -244,11 +294,33 @@ pub struct DefaultLaunchHooks {
     bridge_watchdog: Mutex<Option<BridgeWatchdogRuntime>>,
     computer_use_guard_watchdog: Mutex<Option<ComputerUseGuardWatchdogRuntime>>,
     computer_use_guard_artifacts: Mutex<Option<crate::computer_use_guard::GuardArtifacts>>,
+    #[cfg(windows)]
+    launched_process_handle: Mutex<Option<WindowsProcessHandle>>,
+    #[cfg(windows)]
+    packaged_process: Mutex<Option<WindowsPackagedProcess>>,
+    #[cfg(target_os = "linux")]
+    launched_process_group: Mutex<Option<u32>>,
 }
 
 struct HelperRuntime {
     shutdown: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
+    active_connections: Arc<AtomicUsize>,
+}
+
+struct ActiveHelperConnection(Arc<AtomicUsize>);
+
+impl ActiveHelperConnection {
+    fn new(active_connections: Arc<AtomicUsize>) -> Self {
+        active_connections.fetch_add(1, Ordering::AcqRel);
+        Self(active_connections)
+    }
+}
+
+impl Drop for ActiveHelperConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct BridgeWatchdogRuntime {
@@ -275,30 +347,35 @@ where
     let hooks = hooks.into_launch_hooks();
     let debug_port = hooks.select_debug_port(options.debug_port);
     let mut helper_port = hooks.select_helper_port(options.helper_port);
+    let home = hooks.resolve_codex_home();
+    let mut relay_switch_lock =
+        Some(crate::relay_switch::acquire_relay_switch_lock_async(&home).await?);
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let status_store = options.status_store.clone();
     let mut helper_started = false;
     let mut launched = None;
-    let mut keep_launched_on_error = false;
 
     let result: anyhow::Result<LaunchHandle> = async {
-        let home = crate::relay_config::default_codex_home_dir();
+        if should_apply_active_relay_profile_at_launch(&settings) {
+            hooks.apply_active_relay_profile(&settings, &home).await?;
+        }
         if settings.provider_sync_enabled {
             crate::codex_app_state::capture_app_state_snapshot_nonfatal(&home, "launcher.before");
-            hooks.run_provider_sync().await?;
+            hooks.run_provider_sync(&home).await?;
             crate::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
                 &home,
                 "launcher.after_provider_sync",
             );
         }
-        crate::dream_skin::sync_default_dream_skin_base_theme(
-            settings.enhancements_enabled
-                && settings.codex_app_dream_skin_enabled
-                && !settings.codex_app_dream_skin_paused,
-            &settings.codex_app_dream_skin_theme_config,
-        )?;
-        if let Err(error) = hooks.ensure_plugin_marketplace_config(&settings).await {
+        hooks.sync_dream_skin_base_theme(&settings)?;
+        let active_relay_switch_lock = relay_switch_lock
+            .as_ref()
+            .context("供应商切换锁在启动配置完成前被提前释放")?;
+        if let Err(error) = hooks
+            .ensure_plugin_marketplace_config(&settings, active_relay_switch_lock)
+            .await
+        {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "launcher.plugin_marketplace_config_failed_nonfatal",
                 serde_json::json!({
@@ -309,7 +386,7 @@ where
         if settings.computer_use_guard_enabled {
             hooks.ensure_computer_use_config(&settings).await?;
         }
-        match crate::codex_sqlite::sanitize_historical_model_suffixes(&home) {
+        match hooks.sanitize_historical_model_suffixes(&home) {
             Ok(result) if result.updated > 0 => {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "launcher.sanitize_historical_model_suffixes",
@@ -342,40 +419,62 @@ where
             .launch_codex(&app_dir, debug_port, &settings, &settings.codex_extra_args)
             .await?;
         launched = Some(launch.clone());
-        keep_launched_on_error = true;
         if settings.computer_use_guard_enabled {
             hooks.start_computer_use_guard_watchdog(&settings).await?;
         }
 
+        let page_readiness_error = hooks
+            .wait_for_codex_config_load(debug_port)
+            .await
+            .err()
+            .map(|error| error.to_string());
+        let page_ready = page_readiness_error.is_none();
+        if page_ready {
+            // 页面已确认加载配置，切换锁要守护的「Codex 读到刚写入的配置」目标已达成；
+            // 后续注入重试不读写 config/auth 且可能耗时较久，提前放锁避免阻塞 Manager。
+            drop(relay_switch_lock.take());
+        }
+        let mut injection_ready = false;
         let mut injection_degraded = false;
         if settings.enhancements_enabled {
-            let injection_ready = hooks
+            injection_ready = hooks
                 .ensure_injection(debug_port, helper_port, &app_dir)
                 .await;
             if injection_ready {
-                keep_launched_on_error = false;
                 // 注入成功后页面已加载，此时可以通过 CDP 清理 Electron Local Storage
                 // 中残留的带后缀模型名，避免模型选择器继续显示废弃项。
-                crate::codex_local_storage::sanitize_local_storage_model_suffixes_nonfatal(
-                    debug_port,
-                )
-                .await;
+                hooks
+                    .sanitize_local_storage_model_suffixes(debug_port)
+                    .await;
                 hooks.start_bridge_watchdog(debug_port, helper_port).await?;
             } else {
-                let degraded = launch_status(
-                    "running_degraded",
-                    "Codex launched; Codex++ enhancements are still waiting for the page bridge.",
-                    debug_port,
-                    helper_port,
-                    &app_dir,
-                );
-                options.status_store.save_latest(&degraded)?;
-                hooks.write_status("running_degraded").await;
                 injection_degraded = true;
             }
         }
-
-        if !settings.enhancements_enabled || !injection_degraded {
+        if !page_ready && !injection_ready {
+            anyhow::bail!(
+                "Codex page did not confirm configuration load: {}",
+                page_readiness_error.as_deref().unwrap_or("page not ready")
+            );
+        }
+        if injection_degraded {
+            let message = page_readiness_error
+                .as_deref()
+                .map(|error| format!("Codex launched; page readiness is degraded: {error}"))
+                .unwrap_or_else(|| {
+                    "Codex launched; Codex++ enhancements are still waiting for the page bridge."
+                        .to_string()
+                });
+            let degraded = launch_status(
+                "running_degraded",
+                &message,
+                debug_port,
+                helper_port,
+                &app_dir,
+            );
+            options.status_store.save_latest(&degraded)?;
+            hooks.write_status("running_degraded").await;
+        } else {
             let status = launch_status(
                 "running",
                 "Codex++ launcher ready",
@@ -386,6 +485,7 @@ where
             options.status_store.save_latest(&status)?;
             hooks.write_status("running").await;
         }
+        drop(relay_switch_lock.take());
 
         Ok(LaunchHandle {
             debug_port,
@@ -401,15 +501,18 @@ where
 
     match result {
         Ok(handle) => Ok(handle),
-        Err(error) => {
+        Err(mut error) => {
             if helper_started {
                 hooks.shutdown_helper(helper_port).await;
             }
             if let Some(launch) = &launched {
-                if !keep_launched_on_error {
-                    hooks.terminate_codex(launch).await;
+                if let Err(termination_error) = hooks.terminate_codex(launch).await {
+                    error = anyhow::anyhow!(
+                        "{error:#}; additionally failed to terminate Codex: {termination_error:#}"
+                    );
                 }
             }
+            drop(relay_switch_lock.take());
             let message = error.to_string();
             let failure = launch_status("failed", &message, debug_port, helper_port, &app_dir);
             let _ = status_store.save_latest(&failure);
@@ -421,6 +524,14 @@ where
 
 fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
     settings.active_relay_uses_protocol_proxy()
+}
+
+pub fn should_apply_active_relay_profile_at_launch(settings: &BackendSettings) -> bool {
+    if !settings.relay_profiles_enabled {
+        return false;
+    }
+    let profile = settings.active_relay_profile();
+    profile.relay_mode != crate::settings::RelayMode::Official || profile.official_mix_api_key
 }
 
 fn select_native_menu_inspector_port(debug_port: u16) -> u16 {
@@ -540,16 +651,19 @@ impl LaunchHooks for DefaultLaunchHooks {
         SettingsStore::default().load()
     }
 
-    async fn run_provider_sync(&self) -> anyhow::Result<()> {
+    async fn run_provider_sync(&self, _codex_home: &Path) -> anyhow::Result<()> {
         anyhow::bail!("provider sync requires launcher hooks with codex-plus-data integration")
     }
 
-    async fn apply_active_relay_profile(&self, settings: &BackendSettings) -> anyhow::Result<()> {
+    async fn apply_active_relay_profile(
+        &self,
+        settings: &BackendSettings,
+        codex_home: &Path,
+    ) -> anyhow::Result<()> {
         if !settings.relay_profiles_enabled {
             return Ok(());
         }
         let profile = settings.active_relay_profile();
-        let home = crate::relay_config::default_codex_home_dir();
         let common_config = crate::relay_config::normalize_config_text(
             &[
                 settings.relay_common_config_contents.as_str(),
@@ -567,14 +681,14 @@ impl LaunchHooks for DefaultLaunchHooks {
             let auth_contents = (!profile.auth_contents.trim().is_empty())
                 .then_some(profile.auth_contents.as_str());
             crate::relay_config::clear_relay_config_to_home_with_auth_and_computer_use_guard(
-                &home,
+                codex_home,
                 auth_contents,
                 settings.computer_use_guard_enabled,
             )?;
             return Ok(());
         }
         crate::relay_config::apply_relay_profile_to_home_with_switch_rules_and_computer_use_guard(
-            &home,
+            codex_home,
             &profile,
             &common_config,
             settings.computer_use_guard_enabled,
@@ -596,12 +710,16 @@ impl LaunchHooks for DefaultLaunchHooks {
     async fn ensure_plugin_marketplace_config(
         &self,
         settings: &BackendSettings,
+        relay_switch_lock: &crate::relay_switch::RelaySwitchLockGuard,
     ) -> anyhow::Result<()> {
         if !settings.codex_app_plugin_marketplace_unlock {
             return Ok(());
         }
         let home = crate::relay_config::default_codex_home_dir();
-        match crate::plugin_marketplace::ensure_openai_curated_marketplace_config(&home) {
+        match crate::plugin_marketplace::ensure_openai_curated_marketplace_config_with_lock(
+            &home,
+            relay_switch_lock,
+        ) {
             Ok(configured) => {
                 if configured {
                     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -622,7 +740,10 @@ impl LaunchHooks for DefaultLaunchHooks {
                 );
             }
         }
-        match crate::plugin_marketplace::ensure_role_specific_plugins_marketplace_config(&home) {
+        match crate::plugin_marketplace::ensure_role_specific_plugins_marketplace_config_with_lock(
+            &home,
+            relay_switch_lock,
+        ) {
             Ok(configured) => {
                 if configured {
                     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -662,23 +783,34 @@ impl LaunchHooks for DefaultLaunchHooks {
             }),
         );
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let task_active_connections = Arc::clone(&active_connections);
         let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
+                    _ = connections.join_next(), if !connections.is_empty() => {}
                     accepted = listener.accept() => {
                         if let Ok((stream, addr)) = accepted {
-                            tokio::spawn(async move {
+                            let active_connection = ActiveHelperConnection::new(Arc::clone(
+                                &task_active_connections,
+                            ));
+                            connections.spawn(async move {
+                                let _active_connection = active_connection;
                                 let _ = handle_helper_connection(stream, Some(addr)).await;
                             });
                         }
                     }
                 }
             }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
         });
         *self.helper.lock().await = Some(HelperRuntime {
             shutdown: shutdown_tx,
             task,
+            active_connections,
         });
         Ok(())
     }
@@ -701,7 +833,8 @@ impl LaunchHooks for DefaultLaunchHooks {
         let native_menu_inspector_port =
             native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));
         let launch_extra_args = codex_extra_args_for_launch(settings, extra_args);
-        if cfg!(windows) {
+        #[cfg(windows)]
+        {
             let activation = if let Some(inspector_port) = native_menu_inspector_port {
                 build_packaged_activation_with_native_menu_inspector(
                     app_dir,
@@ -721,7 +854,54 @@ impl LaunchHooks for DefaultLaunchHooks {
                 else {
                     unreachable!();
                 };
-                let process_id = activate_packaged_app(app_user_model_id, arguments).await?;
+                let baseline = match windows_packaged_activation_baseline() {
+                    Ok(identities) => Some(identities),
+                    Err(error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.packaged_activation_baseline_unavailable",
+                            serde_json::json!({
+                                "message": error.to_string()
+                            }),
+                        );
+                        None
+                    }
+                };
+                let (process_id, process_handle) =
+                    activate_packaged_app_with_process_handle(app_user_model_id, arguments).await?;
+                let packaged_process = match process_handle {
+                    Ok(Some(handle)) => match packaged_process_cleanup_action(
+                        baseline.as_deref(),
+                        Some(handle.identity()),
+                    ) {
+                        PackagedProcessCleanupAction::SkipExisting => {
+                            WindowsPackagedProcess::Existing(handle)
+                        }
+                        PackagedProcessCleanupAction::WaitForExitWithoutTermination => {
+                            WindowsPackagedProcess::Unconfirmed {
+                                process_id,
+                                handle: Some(handle),
+                            }
+                        }
+                    },
+                    Ok(None) => WindowsPackagedProcess::Unconfirmed {
+                        process_id,
+                        handle: None,
+                    },
+                    Err(error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.packaged_activation_identity_unavailable",
+                            serde_json::json!({
+                                "process_id": process_id,
+                                "message": error.to_string()
+                            }),
+                        );
+                        WindowsPackagedProcess::Unconfirmed {
+                            process_id,
+                            handle: None,
+                        }
+                    }
+                };
+                *self.packaged_process.lock().await = Some(packaged_process);
                 apply_codexplusplus_window_icon_after_launch(process_id);
                 if let Some(inspector_port) = native_menu_inspector_port {
                     start_native_menu_localizer(inspector_port);
@@ -742,7 +922,7 @@ impl LaunchHooks for DefaultLaunchHooks {
         }
 
         if app_dir.extension().and_then(|value| value.to_str()) == Some("app") {
-            let cleanup_policy = if is_macos_app_running(app_dir).await {
+            let cleanup_policy = if is_macos_app_running(app_dir).await? {
                 MacosCleanupPolicy::SkipQuitBecauseAlreadyRunning
             } else {
                 MacosCleanupPolicy::QuitIfNotPreviouslyRunning
@@ -795,11 +975,52 @@ impl LaunchHooks for DefaultLaunchHooks {
             .args(&command[1..])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        #[cfg(target_os = "linux")]
+        child_command.process_group(0);
         #[cfg(windows)]
         child_command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
         let child = child_command
             .spawn()
             .with_context(|| format!("failed to launch Codex executable {executable}"))?;
+        #[cfg(windows)]
+        let mut child = child;
+        #[cfg(windows)]
+        {
+            let process_id = child.id();
+            let process_handle = match (process_id, child.try_wait()) {
+                (Some(process_id), Ok(None)) => match open_windows_process_handle(process_id, true)
+                {
+                    Ok(Some(handle)) if matches!(child.try_wait(), Ok(None)) => Some(handle),
+                    Ok(Some(_)) | Ok(None) => None,
+                    Err(error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.direct_process_identity_unavailable",
+                            serde_json::json!({
+                                "process_id": process_id,
+                                "message": error.to_string()
+                            }),
+                        );
+                        None
+                    }
+                },
+                (_, Ok(Some(_))) | (None, Ok(None)) => None,
+                (_, Err(error)) => {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.direct_process_state_unavailable",
+                        serde_json::json!({
+                            "process_id": process_id,
+                            "message": error.to_string()
+                        }),
+                    );
+                    None
+                }
+            };
+            *self.launched_process_handle.lock().await = process_handle;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            *self.launched_process_group.lock().await = child.id();
+        }
         *self.child.lock().await = Some(child);
         if let Some(inspector_port) = native_menu_inspector_port {
             start_native_menu_localizer(inspector_port);
@@ -929,6 +1150,28 @@ impl LaunchHooks for DefaultLaunchHooks {
                 }
             }
             CodexLaunch::PackagedActivation { process_id, .. } => {
+                #[cfg(windows)]
+                {
+                    let process = self.packaged_process.lock().await.clone();
+                    match process {
+                        Some(WindowsPackagedProcess::Existing(handle)) => {
+                            wait_for_windows_process_handle(handle).await?;
+                        }
+                        Some(WindowsPackagedProcess::Unconfirmed { process_id, handle }) => {
+                            if let Some(handle) = handle {
+                                wait_for_windows_process_handle(handle).await?;
+                            } else {
+                                wait_for_windows_process_id(process_id).await?;
+                            }
+                        }
+                        None => {
+                            if let Some(process_id) = process_id {
+                                wait_for_windows_process_id(*process_id).await?;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
                 if let Some(process_id) = process_id {
                     wait_for_windows_process_id(*process_id).await?;
                 }
@@ -960,38 +1203,371 @@ impl LaunchHooks for DefaultLaunchHooks {
         }
     }
 
-    async fn terminate_codex(&self, launch: &CodexLaunch) {
+    async fn terminate_codex(&self, launch: &CodexLaunch) -> anyhow::Result<()> {
+        let mut cleanup_errors = Vec::new();
         match launch {
             CodexLaunch::Process {
                 wait_strategy: ProcessWaitStrategy::ExternalWaitCommand,
                 command,
                 macos_cleanup_policy,
             } => {
-                if let Some(mut child) = self.child.lock().await.take() {
-                    let _ = child.kill().await;
-                }
                 if let (Some(app_dir), Some(cleanup_policy)) = (
                     macos_app_dir_from_open_command(command),
                     *macos_cleanup_policy,
                 ) {
-                    let _ = run_macos_cleanup_command(&app_dir, cleanup_policy).await;
+                    if cleanup_policy == MacosCleanupPolicy::SkipQuitBecauseAlreadyRunning {
+                        if let Some(mut child) = self.child.lock().await.take() {
+                            record_cleanup_result(
+                                &mut cleanup_errors,
+                                "terminate macOS open waiter",
+                                terminate_tracked_child(&mut child).await,
+                            );
+                        }
+                    } else {
+                        record_cleanup_result(
+                            &mut cleanup_errors,
+                            "request macOS app quit",
+                            run_macos_cleanup_command(&app_dir, cleanup_policy).await,
+                        );
+                        let mut app_exit_confirmed = false;
+                        let mut child = self.child.lock().await.take();
+                        if let Some(child) = child.as_mut() {
+                            let wait_result = wait_for_tracked_child_exit(child).await;
+                            app_exit_confirmed = wait_result.is_ok();
+                            record_cleanup_result(
+                                &mut cleanup_errors,
+                                "wait for macOS open waiter",
+                                wait_result,
+                            );
+                        }
+                        let app_exit_result = wait_for_macos_app_exit(&app_dir).await;
+                        app_exit_confirmed |= app_exit_result.is_ok();
+                        record_cleanup_result(
+                            &mut cleanup_errors,
+                            "confirm macOS app exit",
+                            app_exit_result,
+                        );
+                        if !app_exit_confirmed {
+                            let waiter = child
+                                .as_mut()
+                                .map(wait_for_tracked_child_exit_without_timeout);
+                            if let Some(error) = wait_for_macos_exit_after_bounded_failures_with(
+                                waiter,
+                                || is_macos_app_running(&app_dir),
+                                std::time::Duration::from_millis(100),
+                            )
+                            .await
+                            {
+                                record_cleanup_result(
+                                    &mut cleanup_errors,
+                                    "wait for macOS open waiter until app exit",
+                                    Err(error),
+                                );
+                            }
+                        }
+                    }
+                } else if let Some(mut child) = self.child.lock().await.take() {
+                    record_cleanup_result(
+                        &mut cleanup_errors,
+                        "terminate external Codex process",
+                        terminate_tracked_child(&mut child).await,
+                    );
                 }
             }
             CodexLaunch::Process { .. } => {
+                #[cfg(windows)]
+                {
+                    let process_handle = self.launched_process_handle.lock().await.take();
+                    if let Some(handle) = process_handle {
+                        record_cleanup_result(
+                            &mut cleanup_errors,
+                            "clean up confirmed Windows Codex process tree",
+                            cleanup_owned_windows_process(handle).await,
+                        );
+                    } else {
+                        if let Some(mut child) = self.child.lock().await.take() {
+                            record_cleanup_result(
+                                &mut cleanup_errors,
+                                "wait for unconfirmed Windows Codex process",
+                                wait_for_tracked_child_exit_confirmed(&mut child).await,
+                            );
+                        }
+                        cleanup_errors.push(
+                            "Windows Codex process identity was not confirmed; no process was terminated"
+                                .to_string(),
+                        );
+                    }
+                    if let Some(mut child) = self.child.lock().await.take() {
+                        record_cleanup_result(
+                            &mut cleanup_errors,
+                            "reap terminated Windows Codex process",
+                            wait_for_tracked_child_exit_confirmed(&mut child).await,
+                        );
+                    }
+                }
+                #[cfg(not(windows))]
                 if let Some(mut child) = self.child.lock().await.take() {
-                    let _ = child.kill().await;
+                    record_cleanup_result(
+                        &mut cleanup_errors,
+                        "terminate tracked Codex process",
+                        terminate_tracked_child(&mut child).await,
+                    );
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(process_group) = self.launched_process_group.lock().await.take() {
+                    record_cleanup_result(
+                        &mut cleanup_errors,
+                        "terminate launched Linux Codex process group",
+                        terminate_linux_process_group_and_wait(process_group).await,
+                    );
                 }
             }
             CodexLaunch::PackagedActivation {
                 process_id: Some(process_id),
                 ..
             } => {
-                let _ = terminate_windows_process_id(*process_id).await;
+                #[cfg(windows)]
+                {
+                    let process = self.packaged_process.lock().await.take();
+                    let (action, unconfirmed_handle, unconfirmed_process_id) = match process {
+                        Some(WindowsPackagedProcess::Existing(_)) => {
+                            (PackagedProcessCleanupAction::SkipExisting, None, None)
+                        }
+                        Some(WindowsPackagedProcess::Unconfirmed { process_id, handle }) => (
+                            PackagedProcessCleanupAction::WaitForExitWithoutTermination,
+                            handle,
+                            Some(process_id),
+                        ),
+                        None => (
+                            PackagedProcessCleanupAction::WaitForExitWithoutTermination,
+                            None,
+                            Some(*process_id),
+                        ),
+                    };
+                    record_cleanup_result(
+                        &mut cleanup_errors,
+                        "clean up Windows packaged process",
+                        cleanup_packaged_process_with(action, || async move {
+                            if let Some(handle) = unconfirmed_handle {
+                                wait_for_windows_process_handle_confirmed(handle).await;
+                            } else {
+                                wait_for_windows_process_exit_confirmed(
+                                    unconfirmed_process_id.unwrap_or(*process_id),
+                                )
+                                .await;
+                            }
+                            Ok(())
+                        })
+                        .await,
+                    );
+                }
+                #[cfg(not(windows))]
+                cleanup_errors.push(format!(
+                    "Windows packaged process {process_id} cannot be cleaned up on this platform"
+                ));
             }
             CodexLaunch::PackagedActivation {
                 process_id: None, ..
             } => {}
         }
+        finish_cleanup(cleanup_errors)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackagedProcessCleanupAction {
+    SkipExisting,
+    WaitForExitWithoutTermination,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsProcessIdentity {
+    process_id: u32,
+    creation_time: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct WindowsProcessHandle(Arc<WindowsProcessHandleInner>);
+
+#[cfg(windows)]
+struct WindowsProcessHandleInner {
+    raw_handle: usize,
+    identity: WindowsProcessIdentity,
+}
+
+#[cfg(windows)]
+impl Drop for WindowsProcessHandleInner {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+
+        let handle = HANDLE(self.raw_handle as *mut core::ffi::c_void);
+        let _ = unsafe { CloseHandle(handle) };
+    }
+}
+
+#[cfg(windows)]
+impl WindowsProcessHandle {
+    fn identity(&self) -> WindowsProcessIdentity {
+        self.0.identity
+    }
+
+    fn raw_handle(&self) -> windows::Win32::Foundation::HANDLE {
+        windows::Win32::Foundation::HANDLE(self.0.raw_handle as *mut core::ffi::c_void)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+enum WindowsPackagedProcess {
+    Existing(WindowsProcessHandle),
+    Unconfirmed {
+        process_id: u32,
+        handle: Option<WindowsProcessHandle>,
+    },
+}
+
+impl WindowsProcessIdentity {
+    pub const fn new(process_id: u32, creation_time: u64) -> Self {
+        Self {
+            process_id,
+            creation_time,
+        }
+    }
+
+    pub const fn process_id(self) -> u32 {
+        self.process_id
+    }
+
+    pub const fn creation_time(self) -> u64 {
+        self.creation_time
+    }
+}
+
+pub fn packaged_process_cleanup_action(
+    baseline: Option<&[WindowsProcessIdentity]>,
+    launched: Option<WindowsProcessIdentity>,
+) -> PackagedProcessCleanupAction {
+    match (baseline, launched) {
+        (Some(processes), Some(launched)) if processes.contains(&launched) => {
+            PackagedProcessCleanupAction::SkipExisting
+        }
+        (Some(_), Some(_)) => PackagedProcessCleanupAction::WaitForExitWithoutTermination,
+        _ => PackagedProcessCleanupAction::WaitForExitWithoutTermination,
+    }
+}
+
+fn packaged_activation_baseline_identities_with<F>(
+    processes: &[(u32, &str)],
+    mut identify: F,
+) -> anyhow::Result<Vec<WindowsProcessIdentity>>
+where
+    F: FnMut(u32) -> anyhow::Result<Option<WindowsProcessIdentity>>,
+{
+    let mut identities = Vec::new();
+    for process_id in crate::watcher::packaged_activation_baseline_process_ids(processes) {
+        let Some(identity) = identify(process_id)? else {
+            continue;
+        };
+        if identity.process_id() != process_id {
+            anyhow::bail!(
+                "Windows process identity mismatch: expected {process_id}, observed {}",
+                identity.process_id()
+            );
+        }
+        identities.push(identity);
+    }
+    Ok(identities)
+}
+
+#[cfg(windows)]
+fn windows_packaged_activation_baseline() -> anyhow::Result<Vec<WindowsProcessIdentity>> {
+    let processes = crate::windows_integration::try_enumerate_processes()?;
+    let process_names = processes
+        .iter()
+        .map(|process| (process.process_id, process.exe_file.as_str()))
+        .collect::<Vec<_>>();
+    packaged_activation_baseline_identities_with(&process_names, |process_id| {
+        open_windows_process_handle(process_id, false)
+            .map(|handle| handle.map(|handle| handle.identity()))
+    })
+}
+
+async fn cleanup_packaged_process_with<Wait, WaitFuture>(
+    action: PackagedProcessCleanupAction,
+    wait_unconfirmed: Wait,
+) -> anyhow::Result<()>
+where
+    Wait: FnOnce() -> WaitFuture,
+    WaitFuture: std::future::Future<Output = anyhow::Result<()>>,
+{
+    match action {
+        PackagedProcessCleanupAction::SkipExisting => Ok(()),
+        PackagedProcessCleanupAction::WaitForExitWithoutTermination => {
+            wait_unconfirmed().await?;
+            anyhow::bail!(
+                "Windows packaged process ownership was not confirmed; no process was terminated"
+            )
+        }
+    }
+}
+
+async fn cleanup_confirmed_process_tree_with<
+    T,
+    Terminate,
+    TerminateFuture,
+    WaitRoot,
+    WaitRootFuture,
+    WaitDescendant,
+    WaitDescendantFuture,
+>(
+    root: T,
+    descendants: anyhow::Result<Vec<T>>,
+    terminate_root: Terminate,
+    wait_root: WaitRoot,
+    mut wait_descendant: WaitDescendant,
+) -> anyhow::Result<()>
+where
+    T: Clone,
+    Terminate: FnOnce(T) -> TerminateFuture,
+    TerminateFuture: std::future::Future<Output = anyhow::Result<()>>,
+    WaitRoot: FnOnce(T) -> WaitRootFuture,
+    WaitRootFuture: std::future::Future<Output = ()>,
+    WaitDescendant: FnMut(T) -> WaitDescendantFuture,
+    WaitDescendantFuture: std::future::Future<Output = ()>,
+{
+    let descendants = match descendants {
+        Ok(descendants) => descendants,
+        Err(error) => {
+            wait_root(root).await;
+            return Err(error).context(
+                "Windows process tree ownership could not be confirmed; no process was terminated",
+            );
+        }
+    };
+
+    let root_confirmation = root.clone();
+    let termination_result = terminate_root(root).await;
+    if termination_result.is_err() {
+        wait_root(root_confirmation).await;
+    }
+    for descendant in descendants {
+        wait_descendant(descendant).await;
+    }
+    termination_result
+}
+
+fn record_cleanup_result(errors: &mut Vec<String>, operation: &str, result: anyhow::Result<()>) {
+    if let Err(error) = result {
+        errors.push(format!("{operation}: {error:#}"));
+    }
+}
+
+fn finish_cleanup(errors: Vec<String>) -> anyhow::Result<()> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(errors.join("; "))
     }
 }
 
@@ -2256,6 +2832,25 @@ async fn retry_injection(debug_port: u16, helper_port: u16) -> anyhow::Result<()
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Codex injection failed")))
 }
 
+async fn wait_for_codex_page(debug_port: u16) -> anyhow::Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+        loop {
+            if crate::cdp::list_targets(debug_port)
+                .await
+                .and_then(|targets| {
+                    crate::cdp::pick_injectable_codex_page_target(&targets).map(|_| ())
+                })
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Codex page did not become ready within 30 seconds"))
+}
+
 pub async fn check_and_reinject_bridge(debug_port: u16, helper_port: u16) -> bool {
     check_and_reinject_bridge_inner(debug_port, helper_port, false).await
 }
@@ -2628,6 +3223,47 @@ pub fn build_macos_cleanup_command(
     ])
 }
 
+async fn terminate_tracked_child(child: &mut Child) -> anyhow::Result<()> {
+    match child.kill().await {
+        Ok(()) => Ok(()),
+        Err(error) => match child.try_wait()? {
+            Some(_) => Ok(()),
+            None => Err(error).context("failed to terminate tracked Codex process"),
+        },
+    }
+}
+
+async fn wait_for_tracked_child_exit(child: &mut Child) -> anyhow::Result<()> {
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+        .await
+        .context("timed out waiting for tracked Codex process to exit")?
+        .context("failed to wait for tracked Codex process")?;
+    if !status.success() {
+        anyhow::bail!("tracked Codex process exited with status {status}");
+    }
+    Ok(())
+}
+
+async fn wait_for_tracked_child_exit_without_timeout(child: &mut Child) -> anyhow::Result<()> {
+    let status = child
+        .wait()
+        .await
+        .context("failed to wait for tracked Codex process")?;
+    if !status.success() {
+        anyhow::bail!("tracked Codex process exited with status {status}");
+    }
+    Ok(())
+}
+
+async fn wait_for_tracked_child_exit_confirmed(child: &mut Child) -> anyhow::Result<()> {
+    loop {
+        match child.wait().await {
+            Ok(_) => return Ok(()),
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+}
+
 async fn run_macos_cleanup_command(
     app_dir: &Path,
     policy: MacosCleanupPolicy,
@@ -2638,13 +3274,21 @@ async fn run_macos_cleanup_command(
     let Some(executable) = command.first() else {
         return Ok(());
     };
-    let _ = Command::new(executable)
-        .args(&command[1..])
+    let mut quit = Command::new(executable);
+    quit.args(&command[1..])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), quit.status())
         .await
+        .context("timed out requesting macOS app quit")?
         .with_context(|| format!("failed to request macOS app quit for {}", app_dir.display()))?;
+    if !status.success() {
+        anyhow::bail!(
+            "macOS app quit request failed for {} with status {status}",
+            app_dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -2653,9 +3297,9 @@ fn macos_app_dir_from_open_command(command: &[String]) -> Option<PathBuf> {
     command.get(app_index + 1).map(PathBuf::from)
 }
 
-async fn is_macos_app_running(app_dir: &Path) -> bool {
+async fn is_macos_app_running(app_dir: &Path) -> anyhow::Result<bool> {
     if !cfg!(target_os = "macos") {
-        return false;
+        return Ok(false);
     }
     let app_name = app_dir
         .file_stem()
@@ -2665,20 +3309,89 @@ async fn is_macos_app_running(app_dir: &Path) -> bool {
         r#"application "{}" is running"#,
         app_name.replace('"', "\\\"")
     );
-    let Ok(output) = Command::new("osascript")
+    let mut query = Command::new("osascript");
+    query
         .arg("-e")
         .arg(script)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(2), query.output())
         .await
-    else {
-        return false;
+        .context("timed out querying macOS app state")?
+        .with_context(|| format!("failed to query macOS app state for {}", app_dir.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "macOS app state query failed for {} with status {}",
+            app_dir.display(),
+            output.status
+        );
+    }
+    let value = String::from_utf8_lossy(&output.stdout);
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => anyhow::bail!(
+            "macOS app state query returned an invalid value for {}: {other}",
+            app_dir.display()
+        ),
+    }
+}
+
+async fn wait_for_macos_app_exit(app_dir: &Path) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while is_macos_app_running(app_dir).await? {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for macOS app exit: {}",
+                app_dir.display()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+pub async fn wait_for_confirmed_macos_app_exit_with<F, Fut, E>(
+    mut is_running: F,
+    retry_interval: std::time::Duration,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool, E>>,
+{
+    loop {
+        if matches!(is_running().await, Ok(false)) {
+            return;
+        }
+        tokio::time::sleep(retry_interval).await;
+    }
+}
+
+pub async fn wait_for_macos_exit_after_bounded_failures_with<
+    WaiterFuture,
+    Query,
+    QueryFuture,
+    QueryError,
+>(
+    waiter: Option<WaiterFuture>,
+    is_running: Query,
+    retry_interval: std::time::Duration,
+) -> Option<anyhow::Error>
+where
+    WaiterFuture: std::future::Future<Output = anyhow::Result<()>>,
+    Query: FnMut() -> QueryFuture,
+    QueryFuture: std::future::Future<Output = Result<bool, QueryError>>,
+{
+    let waiter_error = if let Some(waiter) = waiter {
+        match waiter.await {
+            Ok(()) => return None,
+            Err(error) => Some(error),
+        }
+    } else {
+        None
     };
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .eq_ignore_ascii_case("true")
+    wait_for_confirmed_macos_app_exit_with(is_running, retry_interval).await;
+    waiter_error
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -2802,27 +3515,311 @@ async fn wait_for_windows_process_id(process_id: u32) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-async fn terminate_windows_process_id(process_id: u32) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || terminate_windows_process_id_blocking(process_id))
+async fn wait_for_windows_process_exit_confirmed(process_id: u32) {
+    loop {
+        if wait_for_windows_process_id(process_id).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_parent_map() -> anyhow::Result<HashMap<u32, u32>> {
+    let processes = crate::windows_integration::try_enumerate_processes()?;
+    Ok(processes
+        .iter()
+        .map(|process| (process.process_id, process.parent_process_id))
+        .collect())
+}
+
+#[cfg(windows)]
+fn try_capture_windows_descendant_handles(
+    root: &WindowsProcessHandle,
+) -> anyhow::Result<Vec<WindowsProcessHandle>> {
+    if windows_process_handle_has_exited(root)? {
+        anyhow::bail!("Windows root process exited before descendant identity capture");
+    }
+    let root_identity = root.identity();
+    let first_parents = windows_process_parent_map()?;
+    let mut descendant_ids = first_parents
+        .keys()
+        .copied()
+        .filter(|process_id| {
+            *process_id != root_identity.process_id()
+                && process_descends_from(*process_id, root_identity.process_id(), &first_parents)
+        })
+        .collect::<Vec<_>>();
+    descendant_ids.sort_unstable();
+
+    let mut handles = HashMap::new();
+    for process_id in descendant_ids {
+        let handle = open_windows_process_handle(process_id, false)?.with_context(|| {
+            format!("Windows descendant process {process_id} exited before handle acquisition")
+        })?;
+        handles.insert(process_id, handle);
+    }
+
+    let second_parents = windows_process_parent_map()?;
+    if windows_process_handle_has_exited(root)? {
+        anyhow::bail!("Windows root process exited during descendant identity capture");
+    }
+    let opened_identities = handles
+        .iter()
+        .map(|(process_id, handle)| (*process_id, handle.identity()))
+        .collect::<HashMap<_, _>>();
+    let verified = validate_windows_descendant_identities(
+        root_identity,
+        &first_parents,
+        &second_parents,
+        &opened_identities,
+    )?;
+    let mut verified_handles = Vec::with_capacity(verified.len());
+    for identity in verified {
+        let handle = handles
+            .remove(&identity.process_id())
+            .context("verified Windows descendant handle is unavailable")?;
+        if windows_process_handle_has_exited(&handle)? {
+            anyhow::bail!(
+                "Windows descendant process {} exited during identity validation",
+                identity.process_id()
+            );
+        }
+        verified_handles.push(handle);
+    }
+    if windows_process_handle_has_exited(root)? {
+        anyhow::bail!("Windows root process exited after descendant identity validation");
+    }
+    Ok(verified_handles)
+}
+
+fn process_descends_from(
+    process_id: u32,
+    root_process_id: u32,
+    parents: &HashMap<u32, u32>,
+) -> bool {
+    let mut current = process_id;
+    for _ in 0..=parents.len() {
+        let Some(parent) = parents.get(&current).copied() else {
+            return false;
+        };
+        if parent == root_process_id {
+            return true;
+        }
+        if parent == 0 || parent == current {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn validate_windows_descendant_identities(
+    root: WindowsProcessIdentity,
+    first_parents: &HashMap<u32, u32>,
+    second_parents: &HashMap<u32, u32>,
+    opened: &HashMap<u32, WindowsProcessIdentity>,
+) -> anyhow::Result<Vec<WindowsProcessIdentity>> {
+    let descendant_ids = |parents: &HashMap<u32, u32>| {
+        let mut process_ids = parents
+            .keys()
+            .copied()
+            .filter(|process_id| {
+                *process_id != root.process_id()
+                    && process_descends_from(*process_id, root.process_id(), parents)
+            })
+            .collect::<Vec<_>>();
+        process_ids.sort_unstable();
+        process_ids
+    };
+    let first_descendants = descendant_ids(first_parents);
+    let second_descendants = descendant_ids(second_parents);
+    if first_descendants != second_descendants {
+        anyhow::bail!("Windows descendant process tree changed during identity capture");
+    }
+
+    let mut identities = Vec::with_capacity(second_descendants.len());
+    for process_id in second_descendants {
+        let identity = opened.get(&process_id).copied().with_context(|| {
+            format!("Windows descendant process {process_id} has no stable handle identity")
+        })?;
+        let first_parent = first_parents.get(&process_id).copied();
+        let second_parent = second_parents.get(&process_id).copied();
+        if first_parent != second_parent {
+            anyhow::bail!(
+                "Windows descendant process {process_id} parent changed during identity capture"
+            );
+        }
+        let parent_process_id =
+            second_parent.context("Windows descendant parent is unavailable")?;
+        let parent_identity = if parent_process_id == root.process_id() {
+            root
+        } else {
+            opened.get(&parent_process_id).copied().with_context(|| {
+                format!(
+                    "Windows descendant parent process {parent_process_id} has no stable handle identity"
+                )
+            })?
+        };
+        if parent_identity.creation_time() >= identity.creation_time() {
+            anyhow::bail!(
+                "Windows descendant process {process_id} has an invalid parent/child creation order"
+            );
+        }
+        identities.push(identity);
+    }
+    identities.sort_unstable_by_key(|identity| identity.process_id());
+    Ok(identities)
+}
+
+#[cfg(windows)]
+async fn wait_for_verified_windows_descendant_handles(
+    root: &WindowsProcessHandle,
+) -> anyhow::Result<Vec<WindowsProcessHandle>> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut last_error = None;
+    loop {
+        match try_capture_windows_descendant_handles(root) {
+            Ok(handles) => return Ok(handles),
+            Err(error) => last_error = Some(error),
+        }
+        if windows_process_handle_has_exited(root)? || tokio::time::Instant::now() >= deadline {
+            return Err(last_error.unwrap_or_else(|| {
+                anyhow::anyhow!("Windows descendant identity could not be confirmed")
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(windows)]
+async fn cleanup_owned_windows_process(root: WindowsProcessHandle) -> anyhow::Result<()> {
+    let descendants = wait_for_verified_windows_descendant_handles(&root).await;
+    cleanup_confirmed_process_tree_with(
+        root,
+        descendants,
+        terminate_windows_process_handle,
+        |handle| async move {
+            wait_for_windows_process_handle_confirmed(handle).await;
+        },
+        |handle| async move {
+            wait_for_windows_process_handle_confirmed(handle).await;
+        },
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn terminate_linux_process_group_and_wait(process_group: u32) -> anyhow::Result<()> {
+    if linux_process_group_members(process_group).is_empty() {
+        return Ok(());
+    }
+    let mut cleanup_errors = Vec::new();
+    record_cleanup_result(
+        &mut cleanup_errors,
+        "send TERM to Linux Codex process group",
+        send_linux_process_group_signal(process_group, "-TERM").await,
+    );
+    let remaining = wait_for_linux_process_group_exit(process_group).await;
+    if remaining.is_empty() {
+        return finish_cleanup(cleanup_errors);
+    }
+    record_cleanup_result(
+        &mut cleanup_errors,
+        "send KILL to Linux Codex process group",
+        send_linux_process_group_signal(process_group, "-KILL").await,
+    );
+    let remaining = wait_for_linux_process_group_exit(process_group).await;
+    if !remaining.is_empty() {
+        cleanup_errors.push(format!(
+            "Linux Codex process group {process_group} did not exit after termination: {}",
+            remaining
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    finish_cleanup(cleanup_errors)
+}
+
+#[cfg(target_os = "linux")]
+async fn send_linux_process_group_signal(process_group: u32, signal: &str) -> anyhow::Result<()> {
+    Command::new("kill")
+        .arg(signal)
+        .arg("--")
+        .arg(format!("-{process_group}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
         .await
-        .context("Windows process termination task failed")?
+        .with_context(|| {
+            format!("failed to send {signal} to Linux process group {process_group}")
+        })?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_linux_process_group_exit(process_group: u32) -> Vec<u32> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let remaining = linux_process_group_members(process_group);
+        if remaining.is_empty() || tokio::time::Instant::now() >= deadline {
+            return remaining;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_members(process_group: u32) -> Vec<u32> {
+    let mut members = std::fs::read_dir("/proc")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let process_id = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            (linux_process_group_from_stat(&stat) == Some(process_group)).then_some(process_id)
+        })
+        .collect::<Vec<_>>();
+    members.sort_unstable();
+    members
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_from_stat(stat: &str) -> Option<u32> {
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
 }
 
 #[cfg(windows)]
 fn wait_for_windows_process_id_blocking(process_id: u32) -> anyhow::Result<()> {
-    use windows::Win32::Foundation::{CloseHandle, WAIT_FAILED};
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_FAILED};
     use windows::Win32::System::Threading::{
         INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
         WaitForSingleObject,
     };
 
     unsafe {
-        let handle = OpenProcess(
+        let handle = match OpenProcess(
             PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
             false,
             process_id,
-        )
-        .with_context(|| format!("failed to open Windows process id {process_id}"))?;
+        ) {
+            Ok(handle) => handle,
+            Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to open Windows process id {process_id}"));
+            }
+        };
         let wait_result = WaitForSingleObject(handle, INFINITE);
         let _ = CloseHandle(handle);
         if wait_result == WAIT_FAILED {
@@ -2833,35 +3830,189 @@ fn wait_for_windows_process_id_blocking(process_id: u32) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn terminate_windows_process_id_blocking(process_id: u32) -> anyhow::Result<()> {
-    use windows::Win32::Foundation::CloseHandle;
+fn open_windows_process_handle(
+    process_id: u32,
+    allow_termination: bool,
+) -> anyhow::Result<Option<WindowsProcessHandle>> {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FILETIME};
     use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+        GetProcessId, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
 
     unsafe {
-        let handle = OpenProcess(
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-            false,
-            process_id,
-        )
-        .with_context(|| format!("failed to open Windows process id {process_id}"))?;
-        let terminate_result = TerminateProcess(handle, 1);
-        let _ = CloseHandle(handle);
-        terminate_result
-            .with_context(|| format!("failed to terminate Windows process id {process_id}"))?;
+        let access = if allow_termination {
+            PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        } else {
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        };
+        let handle = match OpenProcess(access, false, process_id) {
+            Ok(handle) => handle,
+            Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to acquire Windows process id {process_id}"));
+            }
+        };
+
+        let identity = (|| -> anyhow::Result<WindowsProcessIdentity> {
+            let observed_process_id = GetProcessId(handle);
+            if observed_process_id != process_id {
+                anyhow::bail!(
+                    "Windows process handle identity mismatch: expected {process_id}, observed {observed_process_id}"
+                );
+            }
+            let mut creation_time = FILETIME::default();
+            let mut exit_time = FILETIME::default();
+            let mut kernel_time = FILETIME::default();
+            let mut user_time = FILETIME::default();
+            GetProcessTimes(
+                handle,
+                &mut creation_time,
+                &mut exit_time,
+                &mut kernel_time,
+                &mut user_time,
+            )
+            .with_context(|| format!("failed to query Windows process id {process_id} times"))?;
+            Ok(WindowsProcessIdentity::new(
+                process_id,
+                filetime_value(creation_time),
+            ))
+        })();
+        let identity = match identity {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = CloseHandle(handle);
+                return Err(error);
+            }
+        };
+        Ok(Some(WindowsProcessHandle(Arc::new(
+            WindowsProcessHandleInner {
+                raw_handle: handle.0 as usize,
+                identity,
+            },
+        ))))
+    }
+}
+
+#[cfg(windows)]
+fn filetime_value(value: windows::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+}
+
+#[cfg(windows)]
+fn current_windows_filetime() -> anyhow::Result<u64> {
+    const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    Ok(
+        (elapsed.as_secs() + WINDOWS_TO_UNIX_EPOCH_SECONDS) * 10_000_000
+            + u64::from(elapsed.subsec_nanos()) / 100,
+    )
+}
+
+#[cfg(windows)]
+fn windows_process_handle_has_exited(handle: &WindowsProcessHandle) -> anyhow::Result<bool> {
+    use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    let wait_result = unsafe { WaitForSingleObject(handle.raw_handle(), 0) };
+    match wait_result {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => anyhow::bail!(
+            "failed to query Windows process id {} state",
+            handle.identity().process_id()
+        ),
+        other => anyhow::bail!(
+            "unexpected wait result {other:?} for Windows process id {}",
+            handle.identity().process_id()
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_windows_process_handle_blocking(handle: &WindowsProcessHandle) -> anyhow::Result<()> {
+    use windows::Win32::Foundation::WAIT_FAILED;
+    use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+
+    let wait_result = unsafe { WaitForSingleObject(handle.raw_handle(), INFINITE) };
+    if wait_result == WAIT_FAILED {
+        anyhow::bail!(
+            "failed to wait for Windows process id {}",
+            handle.identity().process_id()
+        );
     }
     Ok(())
+}
+
+#[cfg(windows)]
+async fn wait_for_windows_process_handle(handle: WindowsProcessHandle) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || wait_for_windows_process_handle_blocking(&handle))
+        .await
+        .context("Windows process handle wait task failed")?
+}
+
+#[cfg(windows)]
+async fn wait_for_windows_process_handle_confirmed(handle: WindowsProcessHandle) {
+    loop {
+        if wait_for_windows_process_handle(handle.clone())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(windows)]
+fn terminate_windows_process_handle_blocking(handle: &WindowsProcessHandle) -> anyhow::Result<()> {
+    use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{INFINITE, TerminateProcess, WaitForSingleObject};
+
+    unsafe {
+        let initial_wait_result = WaitForSingleObject(handle.raw_handle(), 0);
+        if initial_wait_result == WAIT_OBJECT_0 {
+            return Ok(());
+        }
+        if initial_wait_result == WAIT_FAILED {
+            anyhow::bail!(
+                "failed to query Windows process id {} before termination",
+                handle.identity().process_id()
+            );
+        }
+        let terminate_result = TerminateProcess(handle.raw_handle(), 1);
+        let wait_result = terminate_result
+            .is_ok()
+            .then(|| WaitForSingleObject(handle.raw_handle(), INFINITE));
+        terminate_result.with_context(|| {
+            format!(
+                "failed to terminate Windows process id {}",
+                handle.identity().process_id()
+            )
+        })?;
+        if wait_result == Some(WAIT_FAILED) {
+            anyhow::bail!(
+                "failed to wait for terminated Windows process id {}",
+                handle.identity().process_id()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn terminate_windows_process_handle(handle: WindowsProcessHandle) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || terminate_windows_process_handle_blocking(&handle))
+        .await
+        .context("Windows process handle termination task failed")?
 }
 
 #[cfg(not(windows))]
 async fn wait_for_windows_process_id(process_id: u32) -> anyhow::Result<()> {
     anyhow::bail!("cannot wait for Windows process id {process_id} on this platform")
-}
-
-#[cfg(not(windows))]
-async fn terminate_windows_process_id(process_id: u32) -> anyhow::Result<()> {
-    anyhow::bail!("cannot terminate Windows process id {process_id} on this platform")
 }
 
 fn launch_status(
@@ -2929,6 +4080,53 @@ pub async fn activate_packaged_app(
     anyhow::bail!("Packaged app activation is only supported on Windows")
 }
 
+fn capture_packaged_activation_with<T, Activate, Capture>(
+    activate: Activate,
+    capture: Capture,
+) -> anyhow::Result<(u32, T)>
+where
+    Activate: FnOnce() -> anyhow::Result<u32>,
+    Capture: FnOnce(u32) -> T,
+{
+    let process_id = activate()?;
+    Ok((process_id, capture(process_id)))
+}
+
+#[cfg(windows)]
+fn capture_windows_packaged_process_handle(
+    process_id: u32,
+) -> anyhow::Result<Option<WindowsProcessHandle>> {
+    let activation_completed_at = current_windows_filetime()?;
+    open_windows_process_handle(process_id, false).and_then(|handle| {
+        if let Some(handle) = &handle
+            && handle.identity().creation_time() > activation_completed_at
+        {
+            anyhow::bail!(
+                "Windows activation process id {process_id} was reused before handle acquisition"
+            );
+        }
+        Ok(handle)
+    })
+}
+
+#[cfg(windows)]
+async fn activate_packaged_app_with_process_handle(
+    app_user_model_id: &str,
+    arguments: &str,
+) -> anyhow::Result<(u32, anyhow::Result<Option<WindowsProcessHandle>>)> {
+    let app_user_model_id = app_user_model_id.to_string();
+    let arguments = arguments.to_string();
+    tokio::task::spawn_blocking(move || {
+        activate_packaged_app_blocking_with(
+            &app_user_model_id,
+            &arguments,
+            capture_windows_packaged_process_handle,
+        )
+    })
+    .await
+    .context("packaged app activation identity task failed")?
+}
+
 #[cfg(windows)]
 pub async fn activate_packaged_app(
     app_user_model_id: &str,
@@ -2945,6 +4143,19 @@ pub async fn activate_packaged_app(
 
 #[cfg(windows)]
 fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> anyhow::Result<u32> {
+    activate_packaged_app_blocking_with(app_user_model_id, arguments, |_| ())
+        .map(|(process_id, ())| process_id)
+}
+
+#[cfg(windows)]
+fn activate_packaged_app_blocking_with<T, Capture>(
+    app_user_model_id: &str,
+    arguments: &str,
+    capture: Capture,
+) -> anyhow::Result<(u32, T)>
+where
+    Capture: FnOnce(u32) -> T,
+{
     use windows::Win32::System::Com::{
         CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
         CoUninitialize,
@@ -2964,21 +4175,25 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
             }
         })?;
 
-        let result: windows::core::Result<u32> = (|| {
-            let manager: IApplicationActivationManager =
-                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
-            let process_id = manager.ActivateApplication(
-                &HSTRING::from(app_user_model_id),
-                &HSTRING::from(arguments),
-                windows::Win32::UI::Shell::ACTIVATEOPTIONS(0),
-            )?;
-            Ok(process_id)
-        })();
+        let result = capture_packaged_activation_with(
+            || {
+                let manager: IApplicationActivationManager =
+                    CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
+                manager
+                    .ActivateApplication(
+                        &HSTRING::from(app_user_model_id),
+                        &HSTRING::from(arguments),
+                        windows::Win32::UI::Shell::ACTIVATEOPTIONS(0),
+                    )
+                    .map_err(Into::into)
+            },
+            capture,
+        );
 
         if should_uninitialize {
             CoUninitialize();
         }
-        result.map_err(Into::into)
+        result
     }
 }
 
@@ -2995,6 +4210,285 @@ mod tests {
             assert!(!wait.observe(false));
         }
         assert!(!wait.observe(true));
+    }
+
+    #[test]
+    fn packaged_activation_only_skips_an_exact_prelaunch_identity() {
+        let existing = WindowsProcessIdentity::new(42, 100);
+        let reused = WindowsProcessIdentity::new(42, 200);
+
+        assert_eq!(
+            packaged_process_cleanup_action(Some(&[existing]), Some(existing)),
+            PackagedProcessCleanupAction::SkipExisting
+        );
+        assert_eq!(
+            packaged_process_cleanup_action(Some(&[existing]), Some(reused)),
+            PackagedProcessCleanupAction::WaitForExitWithoutTermination
+        );
+        assert_eq!(
+            packaged_process_cleanup_action(None, Some(reused)),
+            PackagedProcessCleanupAction::WaitForExitWithoutTermination
+        );
+    }
+
+    #[test]
+    fn packaged_activation_preserves_pid_when_identity_capture_fails() {
+        let events = std::cell::RefCell::new(Vec::new());
+
+        let (process_id, identity) = capture_packaged_activation_with(
+            || {
+                events.borrow_mut().push("activate");
+                Ok(42)
+            },
+            |observed_process_id| -> anyhow::Result<Option<&'static str>> {
+                events.borrow_mut().push("identify");
+                assert_eq!(observed_process_id, 42);
+                anyhow::bail!("identity unavailable")
+            },
+        )
+        .expect("activation success must preserve the returned process id");
+
+        assert_eq!(process_id, 42);
+        assert_eq!(&*events.borrow(), &["activate", "identify"]);
+        assert!(
+            identity
+                .unwrap_err()
+                .to_string()
+                .contains("identity unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_windows_packaged_cleanup_skips_waiting() {
+        let waited = Arc::new(AtomicUsize::new(0));
+        let wait_count = Arc::clone(&waited);
+
+        cleanup_packaged_process_with(PackagedProcessCleanupAction::SkipExisting, move || {
+            let wait_count = Arc::clone(&wait_count);
+            async move {
+                wait_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(waited.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_windows_packaged_cleanup_waits() {
+        let waited = Arc::new(AtomicUsize::new(0));
+        let wait_count = Arc::clone(&waited);
+
+        let error = cleanup_packaged_process_with(
+            PackagedProcessCleanupAction::WaitForExitWithoutTermination,
+            move || {
+                let wait_count = Arc::clone(&wait_count);
+                async move {
+                    wait_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ownership was not confirmed"));
+        assert_eq!(waited.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn packaged_baseline_collects_stable_identities_for_candidate_names() {
+        let processes = [(41, "ChatGPT.exe"), (42, "helper.exe"), (43, "codex.EXE")];
+        let queried = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&queried);
+
+        let identities =
+            packaged_activation_baseline_identities_with(&processes, move |process_id| {
+                observed.lock().unwrap().push(process_id);
+                Ok((process_id != 43).then(|| WindowsProcessIdentity::new(process_id, 100)))
+            })
+            .unwrap();
+
+        assert_eq!(identities, vec![WindowsProcessIdentity::new(41, 100)]);
+        assert_eq!(*queried.lock().unwrap(), vec![41, 43]);
+    }
+
+    #[test]
+    fn packaged_baseline_identity_failure_invalidates_the_whole_baseline() {
+        let error = packaged_activation_baseline_identities_with(
+            &[(41, "ChatGPT.exe"), (43, "Codex.exe")],
+            |process_id| {
+                if process_id == 43 {
+                    anyhow::bail!("identity unavailable");
+                }
+                Ok(Some(WindowsProcessIdentity::new(process_id, 100)))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("identity unavailable"));
+    }
+
+    #[test]
+    fn descendant_identity_validation_accepts_only_a_stable_creation_ordered_tree() {
+        let root = WindowsProcessIdentity::new(9, 100);
+        let child = WindowsProcessIdentity::new(10, 200);
+        let grandchild = WindowsProcessIdentity::new(11, 300);
+        let first = HashMap::from([(9, 1), (10, 9), (11, 10)]);
+        let second = first.clone();
+        let opened = HashMap::from([(10, child), (11, grandchild)]);
+
+        assert_eq!(
+            validate_windows_descendant_identities(root, &first, &second, &opened).unwrap(),
+            vec![child, grandchild]
+        );
+    }
+
+    #[test]
+    fn descendant_identity_validation_rejects_pid_reuse_and_snapshot_changes() {
+        let root = WindowsProcessIdentity::new(9, 200);
+        let stale_child = WindowsProcessIdentity::new(10, 100);
+        let stable = HashMap::from([(9, 1), (10, 9)]);
+        let opened = HashMap::from([(10, stale_child)]);
+
+        let stale_parent_error =
+            validate_windows_descendant_identities(root, &stable, &stable, &opened).unwrap_err();
+        assert!(stale_parent_error.to_string().contains("creation order"));
+
+        let changed = HashMap::from([(9, 1), (10, 8)]);
+        let changed_error =
+            validate_windows_descendant_identities(root, &stable, &changed, &opened).unwrap_err();
+        assert!(changed_error.to_string().contains("changed"));
+
+        let missing_handle_error =
+            validate_windows_descendant_identities(root, &stable, &stable, &HashMap::new())
+                .unwrap_err();
+        assert!(missing_handle_error.to_string().contains("stable handle"));
+    }
+
+    #[tokio::test]
+    async fn process_tree_identity_failure_waits_without_termination() {
+        let terminated = Arc::new(AtomicUsize::new(0));
+        let root_waited = Arc::new(AtomicUsize::new(0));
+        let descendants_waited = Arc::new(AtomicUsize::new(0));
+        let terminate_count = Arc::clone(&terminated);
+        let root_wait_count = Arc::clone(&root_waited);
+        let descendant_wait_count = Arc::clone(&descendants_waited);
+
+        let error = cleanup_confirmed_process_tree_with(
+            "root",
+            Err(anyhow::anyhow!("snapshot unavailable")),
+            move |_| {
+                let terminate_count = Arc::clone(&terminate_count);
+                async move {
+                    terminate_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            move |root| {
+                let root_wait_count = Arc::clone(&root_wait_count);
+                async move {
+                    assert_eq!(root, "root");
+                    root_wait_count.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+            move |_| {
+                let descendant_wait_count = Arc::clone(&descendant_wait_count);
+                async move {
+                    descendant_wait_count.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("snapshot unavailable"));
+        assert_eq!(terminated.load(Ordering::SeqCst), 0);
+        assert_eq!(root_waited.load(Ordering::SeqCst), 1);
+        assert_eq!(descendants_waited.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_tree_termination_failure_waits_for_root_and_descendants() {
+        let root_waited = Arc::new(AtomicUsize::new(0));
+        let descendants_waited = Arc::new(AtomicUsize::new(0));
+        let root_wait_count = Arc::clone(&root_waited);
+        let descendant_wait_count = Arc::clone(&descendants_waited);
+
+        let error = cleanup_confirmed_process_tree_with(
+            "root",
+            Ok(vec!["child", "grandchild"]),
+            |_| async { anyhow::bail!("termination denied") },
+            move |_| {
+                let root_wait_count = Arc::clone(&root_wait_count);
+                async move {
+                    root_wait_count.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+            move |_| {
+                let descendant_wait_count = Arc::clone(&descendant_wait_count);
+                async move {
+                    descendant_wait_count.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("termination denied"));
+        assert_eq!(root_waited.load(Ordering::SeqCst), 1);
+        assert_eq!(descendants_waited.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn descendant_ownership_only_accepts_tracked_process_tree() {
+        let parents = HashMap::from([(10, 9), (11, 10), (12, 8), (20, 21), (21, 20)]);
+
+        assert!(process_descends_from(10, 9, &parents));
+        assert!(process_descends_from(11, 9, &parents));
+        assert!(!process_descends_from(12, 9, &parents));
+        assert!(!process_descends_from(20, 9, &parents));
+    }
+
+    #[test]
+    fn cleanup_result_reports_every_failed_step() {
+        let mut errors = Vec::new();
+        record_cleanup_result(&mut errors, "first", Err(anyhow::anyhow!("one")));
+        record_cleanup_result(&mut errors, "success", Ok(()));
+        record_cleanup_result(&mut errors, "second", Err(anyhow::anyhow!("two")));
+
+        let message = finish_cleanup(errors).unwrap_err().to_string();
+
+        assert!(message.contains("first: one"));
+        assert!(message.contains("second: two"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_process_termination_waits_for_exit() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_group = child.id().unwrap();
+        let reaper = tokio::spawn(async move { child.wait().await.unwrap() });
+
+        terminate_linux_process_group_and_wait(process_group)
+            .await
+            .unwrap();
+
+        assert!(reaper.is_finished());
+        assert!(!reaper.await.unwrap().success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_group_parser_handles_spaces_and_parentheses_in_name() {
+        assert_eq!(
+            linux_process_group_from_stat("123 (Codex ) worker) S 10 456 789"),
+            Some(456)
+        );
     }
 
     #[test]
@@ -3106,6 +4600,58 @@ mod tests {
         let response = send_raw_helper_request(&request).await;
 
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn helper_shutdown_closes_in_flight_connections() {
+        let hooks = DefaultLaunchHooks::default();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        hooks.start_helper(port).await.unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client
+            .write_all(
+                b"POST /backend/status HTTP/1.1\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let active_connections = hooks
+                    .helper
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|runtime| runtime.active_connections.load(Ordering::Acquire))
+                    .unwrap_or_default();
+                if active_connections == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("helper must accept the in-flight connection before shutdown");
+
+        hooks.shutdown_helper(port).await;
+
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .expect("helper shutdown must close an in-flight connection");
+        match read {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            other => panic!("expected a closed helper connection, got {other:?}"),
+        }
     }
 
     async fn send_raw_helper_request(request: &[u8]) -> Vec<u8> {

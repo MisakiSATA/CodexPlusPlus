@@ -96,6 +96,20 @@ pub fn codex_process_ids<'a>(processes: impl IntoIterator<Item = (u32, &'a str)>
         .collect()
 }
 
+pub fn packaged_activation_baseline_process_ids(processes: &[(u32, &str)]) -> Vec<u32> {
+    let mut process_ids = processes
+        .iter()
+        .filter(|(_, executable)| {
+            executable.eq_ignore_ascii_case("ChatGPT.exe")
+                || executable.eq_ignore_ascii_case("Codex.exe")
+        })
+        .map(|(process_id, _)| *process_id)
+        .collect::<Vec<_>>();
+    process_ids.sort_unstable();
+    process_ids.dedup();
+    process_ids
+}
+
 fn is_windowsapps_codex_app_process(executable: &str) -> bool {
     let executable = executable.replace('/', "\\").to_ascii_lowercase();
     let Some((_, after_windows_apps)) = executable.split_once("\\windowsapps\\") else {

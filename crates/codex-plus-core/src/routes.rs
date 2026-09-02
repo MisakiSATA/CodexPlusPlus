@@ -297,6 +297,9 @@ impl BridgeSettingsService for CoreSettingsService {
     }
 
     async fn set_settings(&self, payload: Value) -> anyhow::Result<BackendSettings> {
+        let home = crate::relay_config::default_codex_home_dir();
+        let _relay_switch_lock =
+            crate::relay_switch::acquire_relay_switch_lock_async(&home).await?;
         self.store.update(payload)
     }
 
