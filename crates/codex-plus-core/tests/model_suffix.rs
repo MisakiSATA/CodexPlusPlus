@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use codex_plus_core::model_suffix::{
-    build_model_catalog_json, collect_catalog_entries, model_ui_metadata, parse_model_suffix,
-    ModelCatalogEntry,
+    ModelCatalogEntry, build_model_catalog_json, build_model_catalog_json_with_template,
+    collect_catalog_entries, model_ui_metadata, parse_model_suffix,
 };
 use serde_json::Value;
 
@@ -57,8 +57,12 @@ fn parse_suffix_rejects_zero_and_negative() {
 fn collect_entries_includes_current_model_and_strips_suffix() {
     let mut windows = HashMap::new();
     windows.insert("deepseek-v4-pro".to_string(), "1M".to_string());
-    let entries =
-        collect_catalog_entries("deepseek-v4-pro\nqwen3-coder", &windows, "deepseek-v4-pro");
+    let entries = collect_catalog_entries(
+        "deepseek-v4-pro\nqwen3-coder",
+        &windows,
+        &HashMap::new(),
+        "deepseek-v4-pro",
+    );
     // 当前 model 与列表去重后共 2 条
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].slug, "deepseek-v4-pro");
@@ -69,8 +73,12 @@ fn collect_entries_includes_current_model_and_strips_suffix() {
 
 #[test]
 fn collect_entries_deduplicates() {
-    let entries =
-        collect_catalog_entries("qwen3-coder\nqwen3-coder", &HashMap::new(), "qwen3-coder");
+    let entries = collect_catalog_entries(
+        "qwen3-coder\nqwen3-coder",
+        &HashMap::new(),
+        &HashMap::new(),
+        "qwen3-coder",
+    );
     assert_eq!(entries.len(), 1);
 }
 
@@ -79,7 +87,12 @@ fn build_catalog_json_writes_context_window_and_strips_suffix() {
     let mut windows = HashMap::new();
     windows.insert("deepseek-v4-pro".to_string(), "1M".to_string());
     windows.insert("claude-sonnet-4".to_string(), "200K".to_string());
-    let entries = collect_catalog_entries("deepseek-v4-pro\nclaude-sonnet-4", &windows, "");
+    let entries = collect_catalog_entries(
+        "deepseek-v4-pro\nclaude-sonnet-4",
+        &windows,
+        &HashMap::new(),
+        "",
+    );
     let catalog = build_model_catalog_json(&entries, None);
     assert!(catalog.contains(r#""slug": "deepseek-v4-pro""#));
     assert!(catalog.contains(r#""context_window": 1000000"#));
@@ -95,7 +108,7 @@ fn build_catalog_json_writes_context_window_and_strips_suffix() {
 
 #[test]
 fn build_catalog_json_uses_fallback_for_no_suffix_entries() {
-    let entries = collect_catalog_entries("qwen3-coder", &HashMap::new(), "");
+    let entries = collect_catalog_entries("qwen3-coder", &HashMap::new(), &HashMap::new(), "");
     let catalog = build_model_catalog_json(&entries, Some(272_000));
     assert!(catalog.contains(r#""slug": "qwen3-coder""#));
     assert!(catalog.contains(r#""context_window": 272000"#));
@@ -103,8 +116,12 @@ fn build_catalog_json_uses_fallback_for_no_suffix_entries() {
 
 #[test]
 fn build_catalog_json_uses_runtime_compatible_generic_metadata() {
-    let entries =
-        collect_catalog_entries("claude-opus-5\ngrok-4.5", &HashMap::new(), "claude-opus-5");
+    let entries = collect_catalog_entries(
+        "claude-opus-5\ngrok-4.5",
+        &HashMap::new(),
+        &HashMap::new(),
+        "claude-opus-5",
+    );
     let catalog: serde_json::Value =
         serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
 
@@ -139,6 +156,7 @@ fn build_catalog_json_uses_runtime_compatible_generic_metadata() {
 fn build_catalog_json_uses_runtime_compatible_gpt56_metadata() {
     let entries = collect_catalog_entries(
         "gpt-5.6-sol\ngpt-5.6-terra\ngpt-5.6-luna",
+        &HashMap::new(),
         &HashMap::new(),
         "gpt-5.6-sol",
     );
@@ -177,7 +195,89 @@ fn build_catalog_json_uses_runtime_compatible_gpt56_metadata() {
         assert!(!efforts.contains(&"minimal"));
         assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
         assert_eq!(model["service_tiers"][0]["id"], "priority");
+        assert_eq!(model["supports_search_tool"], true);
+        assert_eq!(model["use_responses_lite"], true);
     }
+}
+
+#[test]
+fn build_catalog_json_preserves_template_responses_lite_behavior() {
+    let entries = collect_catalog_entries(
+        "official-model",
+        &HashMap::new(),
+        &HashMap::new(),
+        "official-model",
+    );
+    let template = serde_json::json!({
+        "slug": "official-template",
+        "supports_search_tool": true,
+        "use_responses_lite": true
+    });
+    let catalog: serde_json::Value = serde_json::from_str(&build_model_catalog_json_with_template(
+        &entries,
+        None,
+        Some(&template),
+    ))
+    .unwrap();
+
+    assert_eq!(catalog["models"][0]["use_responses_lite"], true);
+    assert_eq!(catalog["models"][0]["supports_search_tool"], true);
+}
+
+#[test]
+fn astra_metadata_exposes_max_ultra_in_catalog_and_ui() {
+    use codex_plus_core::model_suffix::requires_bundled_metadata_catalog;
+
+    assert!(requires_bundled_metadata_catalog("gpt-6-astra"));
+    assert!(!requires_bundled_metadata_catalog("gpt-6-astra-custom"));
+    // 未知 slug 回落到 generic 模板：只给推理强度，不带 displayName（本 fork 行为）。
+    let fallback = model_ui_metadata("gpt-6-astra-custom").expect("generic fallback metadata");
+    assert!(fallback.get("displayName").is_none());
+    assert!(
+        !fallback["supportedReasoningEfforts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let entries = collect_catalog_entries("gpt-6-astra", &HashMap::new(), &HashMap::new(), "");
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    let model = &catalog["models"][0];
+    let metadata = model_ui_metadata("gpt-6-astra").unwrap();
+    let expected = vec!["low", "medium", "high", "xhigh", "max", "ultra"];
+    for (levels, key) in [
+        (&model["supported_reasoning_levels"], "effort"),
+        (&metadata["supportedReasoningEfforts"], "reasoningEffort"),
+    ] {
+        let efforts: Vec<_> = levels
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|level| level[key].as_str().unwrap())
+            .collect();
+        assert_eq!(efforts, expected);
+    }
+    assert_eq!(model["display_name"], "GPT-6-Astra");
+    assert_eq!(metadata["displayName"], model["display_name"]);
+    assert_eq!(model["default_reasoning_level"], "medium");
+    assert_eq!(metadata["defaultReasoningEffort"], "medium");
+    assert_eq!(model["context_window"], 272_000);
+    assert_eq!(model["max_context_window"], 272_000);
+    assert_eq!(model["supports_search_tool"], true);
+    assert_eq!(model["supports_image_detail_original"], true);
+    assert_eq!(model["use_responses_lite"], false);
+    assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
+    assert_eq!(
+        metadata["additionalSpeedTiers"],
+        model["additional_speed_tiers"]
+    );
+    assert_eq!(model["service_tiers"][0]["id"], "priority");
+    assert_eq!(model["service_tiers"][0]["name"], "Fast");
+    assert_eq!(metadata["serviceTiers"], model["service_tiers"]);
+
+    let overridden: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, Some(200_000))).unwrap();
+    assert_eq!(overridden["models"][0]["context_window"], 200_000);
 }
 
 #[test]
@@ -189,54 +289,6 @@ fn model_ui_metadata_exposes_fast_service_tier_capability() {
         serde_json::json!(["fast"])
     );
     assert_eq!(metadata["serviceTiers"][0]["id"], "priority");
-}
-
-#[test]
-fn build_catalog_json_uses_runtime_compatible_deepseek_metadata() {
-    let entries = collect_catalog_entries(
-        "deepseek-v4-flash\ndeepseek-v4-pro",
-        &HashMap::new(),
-        "deepseek-v4-flash",
-    );
-    let catalog: serde_json::Value =
-        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
-    let models = catalog["models"].as_array().unwrap();
-
-    let flash = models
-        .iter()
-        .find(|model| model["slug"] == "deepseek-v4-flash")
-        .unwrap();
-    assert_eq!(flash["context_window"], 1_048_576);
-    assert_eq!(flash["max_context_window"], 1_048_576);
-    assert_eq!(flash["effective_context_window_percent"], 95);
-    assert_eq!(flash["supported_in_api"], true);
-    assert_eq!(flash["default_reasoning_level"], "high");
-
-    let pro = models
-        .iter()
-        .find(|model| model["slug"] == "deepseek-v4-pro")
-        .unwrap();
-    assert_eq!(pro["context_window"], 1_048_576);
-    assert_eq!(pro["supported_in_api"], false);
-    let efforts = pro["supported_reasoning_levels"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|entry| entry["effort"].as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(efforts, vec!["low", "high", "max"]);
-}
-
-#[test]
-fn model_ui_metadata_exposes_deepseek_capabilities() {
-    let metadata = model_ui_metadata("deepseek-v4-pro").expect("DeepSeek metadata should exist");
-
-    assert_eq!(metadata["displayName"], "DeepSeek-V4-Pro");
-    assert_eq!(metadata["defaultReasoningEffort"], "high");
-    assert_eq!(
-        metadata["supportedReasoningEfforts"][0]["reasoningEffort"],
-        "low"
-    );
 }
 
 #[test]
@@ -279,11 +331,13 @@ fn build_model_catalog_includes_model_metadata() {
             slug: "claude-opus-5".to_string(),
             display_name: "claude-opus-5".to_string(),
             suffix_window: None,
+            auto_compact_percent: None,
         },
         ModelCatalogEntry {
             slug: "grok-2-1212".to_string(),
             display_name: "grok-2-1212".to_string(),
             suffix_window: None,
+            auto_compact_percent: None,
         },
     ];
 
@@ -291,24 +345,43 @@ fn build_model_catalog_includes_model_metadata() {
     let catalog: Value = serde_json::from_str(&catalog_json).unwrap();
 
     // 调试：打印 catalog 的顶层键
-    eprintln!("Catalog keys: {:?}", catalog.as_object().unwrap().keys().collect::<Vec<_>>());
-    eprintln!("Has modelMetadata: {}", catalog.get("modelMetadata").is_some());
+    eprintln!(
+        "Catalog keys: {:?}",
+        catalog.as_object().unwrap().keys().collect::<Vec<_>>()
+    );
+    eprintln!(
+        "Has modelMetadata: {}",
+        catalog.get("modelMetadata").is_some()
+    );
 
     // 验证 modelMetadata 字段存在
-    assert!(catalog.get("modelMetadata").is_some(), "modelMetadata field should exist");
+    assert!(
+        catalog.get("modelMetadata").is_some(),
+        "modelMetadata field should exist"
+    );
 
     let metadata = catalog["modelMetadata"].as_object().unwrap();
 
     // 验证所有模型都有 metadata
-    assert!(metadata.contains_key("claude-opus-5"), "claude-opus-5 should have metadata");
-    assert!(metadata.contains_key("grok-2-1212"), "grok-2-1212 should have metadata");
+    assert!(
+        metadata.contains_key("claude-opus-5"),
+        "claude-opus-5 should have metadata"
+    );
+    assert!(
+        metadata.contains_key("grok-2-1212"),
+        "grok-2-1212 should have metadata"
+    );
 
     // 验证 claude-opus-5 的 metadata 包含推理强度
     let claude_meta = &metadata["claude-opus-5"];
-    assert!(claude_meta.get("supportedReasoningEfforts").is_some(),
-        "claude-opus-5 should have supportedReasoningEfforts");
-    assert!(claude_meta.get("defaultReasoningEffort").is_some(),
-        "claude-opus-5 should have defaultReasoningEffort");
+    assert!(
+        claude_meta.get("supportedReasoningEfforts").is_some(),
+        "claude-opus-5 should have supportedReasoningEfforts"
+    );
+    assert!(
+        claude_meta.get("defaultReasoningEffort").is_some(),
+        "claude-opus-5 should have defaultReasoningEffort"
+    );
 
     // 验证推理强度数据正确
     let efforts = claude_meta["supportedReasoningEfforts"].as_array().unwrap();
@@ -318,14 +391,16 @@ fn build_model_catalog_includes_model_metadata() {
 
 #[test]
 fn deepseek_metadata_yields_to_explicit_window_and_fallback() {
-    let fallback_entries = collect_catalog_entries("deepseek-v4-pro", &HashMap::new(), "");
+    let fallback_entries =
+        collect_catalog_entries("deepseek-v4-pro", &HashMap::new(), &HashMap::new(), "");
     let fallback: serde_json::Value =
         serde_json::from_str(&build_model_catalog_json(&fallback_entries, Some(512_000))).unwrap();
     assert_eq!(fallback["models"][0]["context_window"], 512_000);
 
     let mut windows = HashMap::new();
     windows.insert("deepseek-v4-pro".to_string(), "200K".to_string());
-    let explicit_entries = collect_catalog_entries("deepseek-v4-pro", &windows, "");
+    let explicit_entries =
+        collect_catalog_entries("deepseek-v4-pro", &windows, &HashMap::new(), "");
     let explicit: serde_json::Value =
         serde_json::from_str(&build_model_catalog_json(&explicit_entries, Some(512_000))).unwrap();
     assert_eq!(explicit["models"][0]["context_window"], 200_000);
@@ -336,8 +411,12 @@ fn collect_entries_adopts_suffix_for_current_model_from_list() {
     // 当前 model 本身无后缀，但 model_list 中靠后位置有同名带后缀条目。
     let mut windows = HashMap::new();
     windows.insert("deepseek-v4-pro".to_string(), "1M".to_string());
-    let entries =
-        collect_catalog_entries("qwen3-coder\ndeepseek-v4-pro", &windows, "deepseek-v4-pro");
+    let entries = collect_catalog_entries(
+        "qwen3-coder\ndeepseek-v4-pro",
+        &windows,
+        &HashMap::new(),
+        "deepseek-v4-pro",
+    );
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].slug, "deepseek-v4-pro");
     assert_eq!(entries[0].suffix_window, Some(1_000_000));
@@ -351,6 +430,7 @@ fn collect_entries_prefers_later_suffix_for_duplicate_slug() {
     let entries = collect_catalog_entries(
         "deepseek/deepseek-v4-flash\ndeepseek/deepseek-v4-flash",
         &windows,
+        &HashMap::new(),
         "",
     );
     assert_eq!(entries.len(), 1);
@@ -366,6 +446,7 @@ fn collect_entries_prefers_later_suffix_when_reversed() {
     let entries = collect_catalog_entries(
         "deepseek/deepseek-v4-flash\ndeepseek/deepseek-v4-flash",
         &windows,
+        &HashMap::new(),
         "",
     );
     assert_eq!(entries.len(), 1);

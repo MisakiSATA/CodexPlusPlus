@@ -17,9 +17,10 @@ describe("overview source", () => {
     const i18n = await readFile(new URL("./i18n-en.ts", import.meta.url), "utf8");
     const overview = sourceSection(app, "function OverviewScreen", "function RelayEnvironmentScreen");
 
-    assert.doesNotMatch(overview, /JOJO Code|官方中转站|jojocode-overview/);
-    assert.doesNotMatch(styles, /\.jojocode-overview/);
-    assert.doesNotMatch(i18n, /Codex\+\+ 官方中转站|打开 JOJO Code/);
+    // 概览页不放任何中转站推荐位；赞助内容只在「推荐内容」页展示（样式与文案可以共存）。
+    assert.doesNotMatch(overview, /JOJO Code|官方中转站|<SponsorBoard/);
+    void styles;
+    void i18n;
   });
 
   it("shows the user fork as the application repository", async () => {

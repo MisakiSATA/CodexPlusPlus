@@ -36,43 +36,43 @@ fn bundled_target_renderers_and_styles_remain_byte_exact() {
     for (path, hash) in [
         (
             "assets/inject/upstream/dream-skin/windows/renderer-inject.js",
-            "0BFB5F66A0323BF1392B42033E66904DE3EC4BFC8A5BA297F2BB92A4A6740A34",
+            "1F1E408F8B89BEF6B83DE0A5EE047BFB1F8DFD0165628398D520B8897083FFD7",
         ),
         (
             "assets/inject/upstream/dream-skin/windows/dream-skin.css",
-            "926ADA0A750A0EC3BE68B4B8F1E5DCEF5D58A85F3619B2B033856D4DF216EF7B",
+            "EF6A690AFFF79493EA2414C1DFD7837A2527AC3D2387BE24A0960657F55B182C",
         ),
         (
             "assets/inject/upstream/dream-skin/macos/renderer-inject.js",
-            "9ADAB4655C54740C2FCBBD5B2555AACDB659982B855706399B0F5367914511B3",
+            "1F1E408F8B89BEF6B83DE0A5EE047BFB1F8DFD0165628398D520B8897083FFD7",
         ),
         (
             "assets/inject/upstream/dream-skin/macos/dream-skin.css",
-            "EC3C3BC5F6E10E20A3F2307796BD1E1350E80E5D23D37318EE5468833C95A6DF",
+            "EF6A690AFFF79493EA2414C1DFD7837A2527AC3D2387BE24A0960657F55B182C",
         ),
         (
             "assets/inject/upstream/cidala-tiger/windows/renderer-inject.js",
-            "0BFB5F66A0323BF1392B42033E66904DE3EC4BFC8A5BA297F2BB92A4A6740A34",
+            "CCA3A09B3E46AAF538CB121ABE7E6D43B6663F9BCEAD090767F55C2EE1D96C62",
         ),
         (
             "assets/inject/upstream/cidala-tiger/windows/dream-skin.css",
-            "482A60AF98DD6B460BF624C56918C5B57F9CCD5B55E52FA46D486F7D65259D9A",
+            "0C371B7D794C4783648D1733661E8FA8674C872296CE5CF9898B28EB1765425C",
         ),
         (
             "assets/inject/upstream/cidala-tiger/macos/renderer-inject.js",
-            "4E2A74A337B4AB5EE12FE307565C1E6A309FDA8911DFA75C4B9BE8849C7BFF3C",
+            "19202C8A37C7512E65F950A5516A314867FDF305B74B313F0ABCEA8CF7347F59",
         ),
         (
             "assets/inject/upstream/cidala-tiger/macos/dream-skin.css",
-            "5E149E9A13985961C5F3125296178ACB2ABF0B528974F1E616AA625970430562",
+            "45506CA7C71D4E9867287AE2358C4380C0993F0D04039C29FEE6DBEE20495148",
         ),
         (
             "assets/inject/upstream/snow-skin/renderer-inject.js",
-            "0FCDFF4AECD03EAB2CA4EE923CCD20CB97EB5460F7C9F07351A2003FFA76E6FA",
+            "9AE8123B51917975B5D4B91995173A6A4DD3C27C6BD5B465B5670C2C1330955A",
         ),
         (
             "assets/inject/upstream/snow-skin/dream-skin.css",
-            "0AF2D20FBE3E3DD13F0BE7F1E5A90366E1501084827B22C1D4815A421BFCE823",
+            "97807DE20E40680471D211466B657867CB46280F393EF9D7FBBA5CE829AE5599",
         ),
         (
             "assets/inject/upstream/glass-vision/renderer-inject.js",

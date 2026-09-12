@@ -1,8 +1,8 @@
 use codex_plus_core::watcher::{
     build_spawn_launcher_command, build_watcher_install_plan, cdp_listening, codex_process_ids,
     disable_watcher_at, enable_watcher_at, filter_killable_launcher_processes,
-    launcher_stop_complete, process_ids_still_running, should_recover_stale_launcher,
-    watcher_disabled_flag,
+    launcher_stop_complete, macos_launcher_process_names, process_id_is_running,
+    process_ids_still_running, should_recover_stale_launcher, watcher_disabled_flag,
 };
 
 #[test]
@@ -238,6 +238,14 @@ fn launcher_process_filter_protects_current_process_ancestry() {
 }
 
 #[test]
+fn macos_launcher_process_names_cover_development_and_packaged_binaries() {
+    assert_eq!(
+        macos_launcher_process_names(),
+        ["codex-plus-plus", "CodexPlusPlus"]
+    );
+}
+
+#[test]
 fn stale_launcher_recovery_only_runs_when_codex_and_cdp_are_absent() {
     assert!(should_recover_stale_launcher(false, false));
     assert!(!should_recover_stale_launcher(true, false));
@@ -258,6 +266,13 @@ fn launcher_stop_wait_requires_processes_and_guard_port_to_be_gone() {
     assert!(launcher_stop_complete(&[], false));
     assert!(!launcher_stop_complete(&[40], false));
     assert!(!launcher_stop_complete(&[], true));
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn process_liveness_distinguishes_current_and_missing_processes() {
+    assert_eq!(process_id_is_running(std::process::id()), Some(true));
+    assert_eq!(process_id_is_running(u32::MAX), Some(false));
 }
 
 #[cfg(windows)]

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, WindowEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 
 const TRAY_ID: &str = "codex_plus_tray";
 
@@ -14,6 +14,7 @@ const TRAY_MENU_SHOW: &str = "tray_show_main";
 const TRAY_MENU_DREAM_SKIN_APPLY: &str = "tray_apply_dream_skin";
 const TRAY_MENU_QUIT: &str = "tray_quit_app";
 const DREAM_SKIN_DEBUG_PORT: u16 = 9229;
+const MANAGER_NAVIGATION_EVENT: &str = "manager-navigation-requested";
 
 pub fn run() {
     install_panic_logger();
@@ -40,7 +41,7 @@ pub fn run() {
         );
     }
     let show_update = commands::startup_should_show_update();
-    let run_result = tauri::Builder::default()
+    let app_result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let url = if show_update {
@@ -58,17 +59,31 @@ pub fn run() {
             }
             let main_window = main_window_builder.build()?;
             install_tray(app)?;
-            register_main_window_events(main_window);
+            commands::start_weixin_connect_from_saved_settings();
+            register_main_window_events(main_window, startup_is_transient());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::backend_version,
             commands::startup_options,
+            commands::consume_pending_manager_navigation,
             commands::load_overview,
             commands::launch_codex_plus,
             commands::restart_codex_plus,
             commands::load_settings,
             commands::save_settings,
+            commands::list_tools,
+            commands::test_vlm,
+            commands::load_grok_config,
+            commands::save_grok_config,
+            commands::load_grok_providers,
+            commands::apply_grok_relay_profile,
+            commands::weixin_connect_qr_start,
+            commands::weixin_connect_qr_status,
+            commands::weixin_connect_status,
+            commands::weixin_connect_start,
+            commands::weixin_connect_stop,
+            commands::find_desktop_codex_cli,
             commands::dream_skin_status,
             commands::import_dream_skin_image,
             commands::reset_dream_skin_image,
@@ -78,7 +93,13 @@ pub fn run() {
             commands::verify_dream_skin,
             commands::list_dream_skin_themes,
             commands::refresh_dream_skin_market,
+            commands::refresh_dream_skin_community,
+            commands::load_pending_dream_skin_community,
+            commands::confirm_pending_dream_skin_community,
+            commands::dismiss_pending_dream_skin_community,
             commands::install_dream_skin_market_theme,
+            commands::install_dream_skin_community_theme,
+            commands::import_dream_skin_theme_package,
             commands::load_dream_skin_theme,
             commands::create_dream_skin_theme,
             commands::save_dream_skin_theme,
@@ -91,6 +112,9 @@ pub fn run() {
             commands::confirm_pending_provider_import,
             commands::dismiss_pending_provider_import,
             commands::list_local_sessions,
+            commands::import_local_session,
+            commands::load_pending_session_share,
+            commands::import_session_url,
             commands::list_zed_remote_projects,
             commands::open_zed_remote,
             commands::forget_zed_remote_project,
@@ -101,9 +125,20 @@ pub fn run() {
             commands::sync_providers_now,
             commands::load_ads,
             commands::refresh_script_market,
+            commands::refresh_user_script_inventory,
             commands::install_market_script,
             commands::set_user_script_enabled,
             commands::delete_user_script,
+            commands::refresh_skill_catalog,
+            commands::list_installed_skills,
+            commands::install_skill,
+            commands::update_skill,
+            commands::set_skill_enabled,
+            commands::uninstall_skill,
+            commands::restore_skill_backup,
+            commands::delete_skill_backup,
+            commands::upsert_skill_repo,
+            commands::delete_skill_repo,
             commands::open_external_url,
             commands::install_entrypoints,
             commands::uninstall_entrypoints,
@@ -137,11 +172,16 @@ pub fn run() {
             commands::sync_live_context_entries,
             commands::upsert_context_entry,
             commands::delete_context_entry,
+            commands::parse_mcp_entry,
+            commands::build_mcp_entry,
+            commands::preview_mcp_servers_json,
+            commands::import_mcp_servers_json,
             commands::extract_relay_common_config,
             commands::test_relay_profile,
             commands::diagnose_relay_profile,
             commands::test_stepwise_settings,
             commands::fetch_relay_profile_models,
+            commands::fetch_sub2api_billing,
             commands::switch_relay_profile,
             commands::apply_relay_injection,
             commands::apply_pure_api_injection,
@@ -150,14 +190,71 @@ pub fn run() {
             manager_hide_to_tray,
             update_tray_labels
         ])
-        .run(tauri::generate_context!());
-    if let Err(error) = run_result {
-        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "manager.run_failed",
-            serde_json::json!({
-                "error": error.to_string()
-            }),
-        );
+        .build(tauri::generate_context!());
+    match app_result {
+        Ok(app) => app.run(|app_handle, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = event {
+                for url in urls {
+                    if handle_session_share_url(url.as_str()) || handle_dream_skin_url(url.as_str())
+                    {
+                        show_main_window(app_handle);
+                    }
+                }
+            }
+        }),
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.run_failed",
+                serde_json::json!({
+                    "error": error.to_string()
+                }),
+            );
+        }
+    }
+}
+
+pub fn handle_dream_skin_url(url: &str) -> bool {
+    if !url.starts_with("dreamskin://") {
+        return false;
+    }
+    match codex_plus_core::dream_skin_community::save_pending_community_link(url) {
+        Ok(version_id) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.dream_skin_link.pending",
+                serde_json::json!({ "versionId": version_id }),
+            );
+            true
+        }
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.dream_skin_link.failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+            false
+        }
+    }
+}
+
+pub fn handle_session_share_url(url: &str) -> bool {
+    if !url.starts_with("codexplusplus://session") {
+        return false;
+    }
+    match codex_plus_core::session_share::save_pending_session_share_from_protocol_url(url) {
+        Ok(_) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.session_share.pending",
+                serde_json::json!({}),
+            );
+            true
+        }
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.session_share.failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+            false
+        }
     }
 }
 
@@ -214,10 +311,15 @@ fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-fn register_main_window_events<R: tauri::Runtime>(window: tauri::WebviewWindow<R>) {
+fn register_main_window_events<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    transient: bool,
+) {
     let event_window = window.clone();
     let minimized_window = event_window.clone();
     let close_event_window = event_window.clone();
+    let close_event_app = event_window.app_handle().clone();
+    let focus_event_window = event_window.clone();
 
     event_window.on_window_event(move |event| match event {
         WindowEvent::Resized(_) => {
@@ -225,8 +327,17 @@ fn register_main_window_events<R: tauri::Runtime>(window: tauri::WebviewWindow<R
                 let _ = minimized_window.hide();
             }
         }
+        WindowEvent::Focused(true) => {
+            let _ = focus_event_window.emit(MANAGER_NAVIGATION_EVENT, ());
+        }
         WindowEvent::CloseRequested { api, .. } => {
             if APP_EXITING.load(Ordering::SeqCst) {
+                return;
+            }
+
+            if transient {
+                APP_EXITING.store(true, Ordering::SeqCst);
+                close_event_app.exit(0);
                 return;
             }
 
@@ -235,6 +346,10 @@ fn register_main_window_events<R: tauri::Runtime>(window: tauri::WebviewWindow<R
         }
         _ => {}
     });
+}
+
+fn startup_is_transient() -> bool {
+    std::env::args().any(|arg| arg == "--transient")
 }
 
 #[tauri::command]

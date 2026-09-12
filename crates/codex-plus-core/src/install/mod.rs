@@ -11,6 +11,7 @@ pub mod windows;
 pub const SILENT_NAME: &str = "Codex++";
 pub const MANAGER_NAME: &str = "Codex++ 管理工具";
 pub const SILENT_BINARY: &str = "codex-plus-plus";
+pub const MACOS_SILENT_EXECUTABLE: &str = "CodexPlusPlus";
 pub const MANAGER_BINARY: &str = "codex-plus-plus-manager";
 pub const SILENT_BUNDLE_ID: &str = "com.bigpizzav3.codexplusplus";
 pub const MANAGER_BUNDLE_ID: &str = "com.bigpizzav3.codexplusplus.manager";
@@ -128,9 +129,21 @@ pub fn build_linux_entrypoint_plan(options: &InstallOptions) -> linux::LinuxEntr
 
 pub fn remove_owned_data() -> std::io::Result<()> {
     let dir = crate::paths::default_app_state_dir();
-    if dir.exists() {
-        std::fs::remove_dir_all(dir)?;
+    if !dir.exists() {
+        return Ok(());
     }
+    // 卸载流程会递归删除，路径来自环境/推导，先过一道"不许删 CODEX_HOME 及其祖先"
+    // 的兜底（#2146）。守卫只在这条路径确实指向 home 时才会拒绝，正常卸载不受影响。
+    if let Err(error) = crate::codex_home::ensure_safe_recursive_removal(
+        &dir,
+        &crate::codex_home::default_codex_home_dir(),
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            error.to_string(),
+        ));
+    }
+    std::fs::remove_dir_all(dir)?;
     Ok(())
 }
 
@@ -361,6 +374,24 @@ where
     Ok(path.to_string_lossy().to_string())
 }
 
+pub fn open_or_activate_manager() -> anyhow::Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+        if let Some(bundle_id) = macos_companion_bundle_identifier_from_exe(&exe, MANAGER_BINARY) {
+            let activated = Command::new("/usr/bin/open")
+                .args(["-b", bundle_id])
+                .status()
+                .is_ok_and(|status| status.success());
+            if activated {
+                return Ok(format!("bundle:{bundle_id}"));
+            }
+        }
+    }
+
+    spawn_companion(MANAGER_BINARY, std::iter::empty::<&str>())
+}
+
 pub fn macos_companion_bundle_identifier_from_exe(
     exe: &Path,
     binary: &str,
@@ -382,13 +413,48 @@ pub fn companion_binary_path_from_exe(exe: &Path, binary: &str) -> PathBuf {
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
     let suffix = if cfg!(windows) { ".exe" } else { "" };
     if let Some(bundle_binary) = macos_companion_binary_from_exe(exe, binary) {
-        return bundle_binary;
+        // A local Tauri bundle contains the manager only. Prefer the freshly
+        // built launcher beside `target/release` when the sibling app is not
+        // present, while keeping the installed /Applications layout intact.
+        if bundle_binary.exists() || !is_macos_development_bundle(exe) {
+            return bundle_binary;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(development_binary) = macos_development_companion_binary(exe, binary) {
+        return development_binary;
     }
     let same_bundle = dir.join(binary);
     if same_bundle.exists() {
         return same_bundle;
     }
     dir.join(format!("{binary}{suffix}"))
+}
+
+fn is_macos_development_bundle(exe: &Path) -> bool {
+    exe.components()
+        .any(|component| component.as_os_str() == "target")
+        && exe
+            .components()
+            .any(|component| component.as_os_str() == "bundle")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_development_companion_binary(exe: &Path, binary: &str) -> Option<PathBuf> {
+    let mut path = exe.parent()?;
+    while let Some(parent) = path.parent() {
+        if matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("release" | "debug")
+        ) {
+            let candidate = path.join(binary);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        path = parent;
+    }
+    None
 }
 
 fn macos_companion_binary_from_exe(exe: &Path, binary: &str) -> Option<PathBuf> {

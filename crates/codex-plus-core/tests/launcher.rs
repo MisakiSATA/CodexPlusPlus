@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use codex_plus_core::app_paths::{
-    build_codex_executable, codex_app_version, find_latest_codex_app_dir,
+    build_codex_executable, codex_app_version, find_bundled_codex_cli, find_latest_codex_app_dir,
     find_latest_codex_app_dir_from_roots, find_macos_codex_app, normalize_codex_app_path,
     packaged_app_user_model_id, resolve_codex_app_dir_with_saved, user_data_candidates_from,
 };
@@ -10,12 +10,13 @@ use codex_plus_core::app_paths::{
 use codex_plus_core::app_paths::{find_linux_codex_app, find_linux_codex_app_default_from};
 use codex_plus_core::launcher::{
     CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
-    browser_identity_changed, build_codex_arguments, build_codex_arguments_for_settings,
-    build_codex_arguments_with_native_menu_inspector, build_codex_command,
-    build_codex_command_with_native_menu_inspector, build_macos_cleanup_command,
-    build_macos_open_command, build_macos_open_command_with_native_menu_inspector,
-    build_packaged_activation, build_packaged_activation_with_native_menu_inspector,
-    launch_and_inject_with_hooks,
+    MacosDebugLaunchAction, browser_identity_changed, build_codex_arguments,
+    build_codex_arguments_for_settings, build_codex_arguments_with_native_menu_inspector,
+    build_codex_command, build_codex_command_with_native_menu_inspector,
+    build_macos_cleanup_command, build_macos_open_command,
+    build_macos_open_command_with_native_menu_inspector, build_packaged_activation,
+    build_packaged_activation_with_native_menu_inspector, launch_and_inject_with_hooks,
+    select_macos_debug_launch_action,
 };
 #[cfg(windows)]
 use codex_plus_core::launcher::{WindowsProcessControlStrategy, windows_process_control_strategy};
@@ -23,7 +24,9 @@ use codex_plus_core::ports::{
     select_packaged_codex_debug_port_with, select_platform_loopback_port_with,
 };
 use codex_plus_core::relay_switch::acquire_relay_switch_lock;
-use codex_plus_core::settings::{BackendSettings, RelayProfile, RelayProtocol, SettingsStore};
+use codex_plus_core::settings::{
+    BackendSettings, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, SettingsStore,
+};
 use codex_plus_core::status::StatusStore;
 
 #[test]
@@ -49,7 +52,7 @@ fn app_paths_find_latest_windows_package_prefers_highest_version_app_dir() {
 }
 
 #[test]
-fn app_paths_find_latest_windows_package_ignores_chatgpt_desktop_package() {
+fn app_paths_find_latest_windows_package_accepts_chatgpt_desktop_migration() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("OpenAI.Codex_26.707.3748.0_x64__abc/app")).unwrap();
     std::fs::create_dir_all(
@@ -59,7 +62,7 @@ fn app_paths_find_latest_windows_package_ignores_chatgpt_desktop_package() {
     .unwrap();
     std::fs::create_dir_all(
         temp.path()
-            .join("OpenAI.ChatGPT-Desktop_2026.514.421.0_neutral_~_abc"),
+            .join("OpenAI.ChatGPT-Desktop_2026.514.421.0_neutral_~_abc/app"),
     )
     .unwrap();
 
@@ -67,12 +70,17 @@ fn app_paths_find_latest_windows_package_ignores_chatgpt_desktop_package() {
 
     assert_eq!(
         latest,
-        temp.path().join("OpenAI.Codex_26.707.3748.0_x64__abc/app")
+        temp.path()
+            .join("OpenAI.ChatGPT-Desktop_2026.514.421.0_neutral_~_abc")
+            .join("app")
     );
-    assert_eq!(codex_app_version(&latest).as_deref(), Some("26.707.3748.0"));
+    assert_eq!(
+        codex_app_version(&latest).as_deref(),
+        Some("2026.514.421.0")
+    );
     assert_eq!(
         packaged_app_user_model_id(&latest).as_deref(),
-        Some("OpenAI.Codex_abc!App")
+        Some("OpenAI.ChatGPT-Desktop_abc!App")
     );
 }
 
@@ -121,8 +129,23 @@ fn app_paths_find_latest_windows_package_checks_roots_before_fallback() {
     assert!(latest.ends_with("OpenAI.Codex_26.513.3673.0_x64__abc/app"));
 }
 
+#[cfg(windows)]
 #[test]
-fn app_paths_find_latest_windows_package_ignores_chatgpt_across_roots() {
+fn app_paths_keep_explicit_store_path_override_without_re_resolving() {
+    let temp = tempfile::tempdir().unwrap();
+    let explicit = temp
+        .path()
+        .join("OpenAI.Codex_26.707.3748.0_x64__abc")
+        .join("app");
+    std::fs::create_dir_all(&explicit).unwrap();
+
+    let resolved = resolve_codex_app_dir_with_saved(Some(&explicit), None);
+
+    assert_eq!(resolved.as_deref(), Some(explicit.as_path()));
+}
+
+#[test]
+fn app_paths_find_latest_windows_package_accepts_chatgpt_migration_across_roots() {
     let temp = tempfile::tempdir().unwrap();
     let root_a = temp.path().join("WindowsAppsA");
     let root_b = temp.path().join("WindowsAppsB");
@@ -132,7 +155,7 @@ fn app_paths_find_latest_windows_package_ignores_chatgpt_across_roots() {
 
     let latest = find_latest_codex_app_dir_from_roots(&[root_a, root_b]).unwrap();
 
-    assert!(latest.ends_with("OpenAI.Codex_26.999.0.0_x64__abc/app"));
+    assert!(latest.ends_with("OpenAI.ChatGPT-Desktop_1.2026.133.0_x64__abc/app"));
 }
 
 #[test]
@@ -293,6 +316,37 @@ fn app_paths_build_macos_bundle_executable() {
         build_codex_executable(&app),
         PathBuf::from("/Applications/OpenAI Codex.app/Contents/MacOS/Codex")
     );
+}
+
+#[test]
+fn app_paths_finds_macos_bundled_codex_cli() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp.path().join("ChatGPT.app");
+    let cli = app.join("Contents/Resources/codex");
+    std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+    std::fs::write(&cli, "").unwrap();
+
+    assert_eq!(find_bundled_codex_cli(&app).as_deref(), Some(cli.as_path()));
+}
+
+#[test]
+fn app_paths_finds_windows_bundled_codex_cli() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp.path().join("OpenAI.Codex_1.0.0.0_x64__abc/app");
+    let cli = app.join("resources/codex.exe");
+    std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+    std::fs::write(&cli, "").unwrap();
+
+    assert_eq!(find_bundled_codex_cli(&app).as_deref(), Some(cli.as_path()));
+}
+
+#[test]
+fn app_paths_returns_none_when_bundled_codex_cli_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp.path().join("ChatGPT.app");
+    std::fs::create_dir_all(app.join("Contents/Resources")).unwrap();
+
+    assert_eq!(find_bundled_codex_cli(&app), None);
 }
 
 #[test]
@@ -543,12 +597,19 @@ fn launcher_does_not_override_codex_app_environment() {
 }
 
 #[test]
-fn launcher_prepares_projectless_main_window_when_enhancements_are_enabled() {
+fn launcher_uses_all_com_server_contexts_for_packaged_app_activation() {
     let source = include_str!("../src/launcher.rs");
 
-    assert!(source.contains("if settings.enhancements_enabled"));
-    assert!(source.contains("prepare_projectless_main_window_nonfatal"));
-    assert!(source.contains("launcher.prelaunch"));
+    assert!(source.contains("CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_ALL)?"));
+    assert!(!source.contains("CLSCTX_LOCAL_SERVER"));
+}
+
+#[test]
+fn launcher_does_not_prepare_projectless_main_window() {
+    let source = include_str!("../src/launcher.rs");
+
+    assert!(!source.contains("prepare_projectless_main_window_nonfatal"));
+    assert!(!source.contains("launcher.prelaunch"));
 }
 
 #[test]
@@ -689,6 +750,49 @@ fn launcher_packaged_activation_appends_extra_codex_arguments() {
                     .to_string(),
             process_id: None,
         }
+    );
+}
+
+#[test]
+fn packaged_app_user_model_id_reads_application_id_from_manifest() {
+    // 新版 ChatGPT Desktop 可能调整 manifest 中的 Application Id（见 issue #2148）。
+    let temp = tempfile::tempdir().unwrap();
+    let package_dir = temp
+        .path()
+        .join("OpenAI.ChatGPT-Desktop_1.2026.190.0_x64__2p2nqsd0c76g0");
+    let app_dir = package_dir.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        package_dir.join("AppxManifest.xml"),
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+            "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\"> ",
+            "<Applications><Application Id=\"ChatGPTDesktop\" ",
+            "Executable=\"app\\ChatGPT.exe\" EntryPoint=\"Windows.FullTrustApplication\"/>",
+            "</Applications></Package>"
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        packaged_app_user_model_id(&app_dir).as_deref(),
+        Some("OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!ChatGPTDesktop")
+    );
+}
+
+#[test]
+fn packaged_app_user_model_id_falls_back_to_default_id_without_manifest() {
+    // manifest 缺失/不可读时保持旧行为（仍使用历史默认值 "App"）。
+    let temp = tempfile::tempdir().unwrap();
+    let package_dir = temp
+        .path()
+        .join("OpenAI.Codex_26.506.2212.0_x64__2p2nqsd0c76g0");
+    let app_dir = package_dir.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+
+    assert_eq!(
+        packaged_app_user_model_id(&app_dir).as_deref(),
+        Some("OpenAI.Codex_2p2nqsd0c76g0!App")
     );
 }
 
@@ -963,13 +1067,21 @@ fn ports_falls_back_to_ephemeral_when_requested_is_busy() {
 
 #[test]
 fn ports_windows_packaged_debug_falls_back_to_ephemeral_when_requested_is_busy() {
-    let selected = select_packaged_codex_debug_port_with(9229, true, |_| false, || 43001);
+    let selected =
+        select_packaged_codex_debug_port_with(9229, true, |_| false, |_| false, || 43001);
 
     assert_eq!(selected, 43001);
 }
 
 #[test]
-fn ports_keeps_requested_when_fallback_disabled() {
+fn ports_windows_packaged_debug_keeps_requested_when_existing_cdp_is_available() {
+    let selected = select_packaged_codex_debug_port_with(9229, true, |_| false, |_| true, || 43001);
+
+    assert_eq!(selected, 9229);
+}
+
+#[test]
+fn ports_non_windows_keeps_requested_even_when_busy() {
     let selected = select_platform_loopback_port_with(9229, false, |_| false, || 43001);
 
     assert_eq!(selected, 9229);
@@ -994,6 +1106,7 @@ async fn default_helper_serves_backend_status_over_http() {
     let payload: serde_json::Value = response.json().await.unwrap();
     assert_eq!(payload["status"], "ok");
     assert_eq!(payload["transport"], "http-helper");
+    assert!(payload["hideOfficialUsageAlert"].is_boolean());
 
     let repair_response = client
         .post(format!("http://127.0.0.1:{port}/backend/repair"))
@@ -1105,7 +1218,6 @@ async fn launch_lifecycle_runs_enabled_maintenance_without_applying_relay_profil
         .with_settings(BackendSettings {
             provider_sync_enabled: true,
             relay_profiles_enabled: true,
-            computer_use_guard_enabled: true,
             codex_app_plugin_marketplace_unlock: true,
             ..BackendSettings::default()
         })
@@ -1135,10 +1247,8 @@ async fn launch_lifecycle_runs_enabled_maintenance_without_applying_relay_profil
             "select-helper:57321",
             "load-settings",
             "provider-sync",
-            "computer-use-guard",
             "start-helper:57321",
             "launch:9229",
-            "computer-use-guard-watchdog",
             "inject:9229:57321",
             "status:running",
             "wait-codex",
@@ -1148,8 +1258,6 @@ async fn launch_lifecycle_runs_enabled_maintenance_without_applying_relay_profil
     let events = events.lock().unwrap().clone();
     assert!(!events.contains(&"apply-relay".to_string()));
     assert!(events.contains(&"provider-sync".to_string()));
-    assert!(events.contains(&"computer-use-guard".to_string()));
-    assert!(events.contains(&"computer-use-guard-watchdog".to_string()));
     assert_eq!(
         handle
             .status_store
@@ -1308,14 +1416,24 @@ async fn launch_lifecycle_skips_helper_and_injection_when_enhancements_disabled(
 }
 
 #[tokio::test]
-async fn launch_lifecycle_runs_computer_use_guard_when_enabled() {
+async fn official_mix_responses_profile_starts_fixed_protocol_proxy_without_enhancements() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
     let status_store = StatusStore::new(temp.path().join("latest-status.json"));
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
     let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
-        computer_use_guard_enabled: true,
+        enhancements_enabled: false,
+        relay_profiles_enabled: true,
+        active_relay_id: "official-mix".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "official-mix".to_string(),
+            relay_mode: RelayMode::Official,
+            official_mix_api_key: true,
+            hide_official_usage_alert: false,
+            protocol: RelayProtocol::Responses,
+            ..RelayProfile::default()
+        }],
         ..BackendSettings::default()
     });
 
@@ -1323,47 +1441,7 @@ async fn launch_lifecycle_runs_computer_use_guard_when_enabled() {
         LaunchOptions {
             app_dir: Some(app_dir),
             debug_port: 9229,
-            helper_port: 57321,
-            status_store,
-        },
-        &hooks,
-    )
-    .await
-    .unwrap();
-    handle.wait_for_codex_exit().await.unwrap();
-
-    assert_eq!(
-        *events.lock().unwrap(),
-        vec![
-            "select-debug:9229",
-            "select-helper:57321",
-            "load-settings",
-            "computer-use-guard",
-            "start-helper:57321",
-            "launch:9229",
-            "computer-use-guard-watchdog",
-            "inject:9229:57321",
-            "status:running",
-            "wait-codex",
-            "shutdown-helper:57321",
-        ]
-    );
-}
-
-#[tokio::test]
-async fn launch_lifecycle_skips_computer_use_guard_by_default() {
-    let temp = tempfile::tempdir().unwrap();
-    let app_dir = temp.path().join("Codex.app");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
-    let events = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hooks = FakeHooks::new(events.clone());
-
-    let handle = launch_and_inject_with_hooks(
-        LaunchOptions {
-            app_dir: Some(app_dir),
-            debug_port: 9229,
-            helper_port: 57321,
+            helper_port: 58123,
             status_store,
         },
         &hooks,
@@ -1373,8 +1451,67 @@ async fn launch_lifecycle_skips_computer_use_guard_by_default() {
     handle.wait_for_codex_exit().await.unwrap();
 
     let events = events.lock().unwrap().clone();
-    assert!(!events.contains(&"computer-use-guard".to_string()));
-    assert!(!events.contains(&"computer-use-guard-watchdog".to_string()));
+    assert!(!events.contains(&"remote-control-session-recovery".to_string()));
+    assert!(!events.contains(&"provider-sync".to_string()));
+    assert!(events.contains(&"select-helper:58123".to_string()));
+    assert!(events.contains(&"start-helper:57321".to_string()));
+    assert!(events.contains(&"shutdown-helper:57321".to_string()));
+    assert!(!events.iter().any(|event| event.starts_with("inject:")));
+}
+
+fn official_mix_responses_settings() -> BackendSettings {
+    BackendSettings {
+        enhancements_enabled: false,
+        relay_profiles_enabled: true,
+        active_relay_id: "official-mix".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "official-mix".to_string(),
+            relay_mode: RelayMode::Official,
+            official_mix_api_key: true,
+            hide_official_usage_alert: false,
+            protocol: RelayProtocol::Responses,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    }
+}
+
+/// issue #1933：管理器「重启」先强杀旧 launcher 再拉新的，旧 helper 交还 57321 要一小会儿。
+/// 该端口写死在 config.toml 的 base_url 里换不了，所以必须等前任让位，
+/// 而不是像过去那样一次 bind 失败就中止整个启动。
+#[tokio::test]
+async fn fixed_protocol_proxy_port_waits_for_the_previous_helper_to_release_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(official_mix_responses_settings())
+        .with_helper_bind_conflicts(3);
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58123,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    handle.wait_for_codex_exit().await.unwrap();
+
+    let events = events.lock().unwrap().clone();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.as_str() == "start-helper-busy:57321")
+            .count(),
+        3
+    );
+    assert!(events.contains(&"start-helper:57321".to_string()));
     assert!(events.contains(&"launch:9229".to_string()));
 }
 
@@ -1427,6 +1564,159 @@ fn launch_lifecycle_waits_for_relay_switch_lock_before_loading_settings() {
             .unwrap()
             .contains(&"load-settings".to_string())
     );
+}
+
+/// 等不到就得给出能照着做的说明，而不是裸的 bind 失败。
+#[tokio::test]
+async fn a_permanently_busy_protocol_proxy_port_reports_what_the_user_should_do() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(official_mix_responses_settings())
+        .with_helper_bind_conflicts(u32::MAX);
+
+    let error = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58123,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap_err();
+
+    let message = format!("{error:#}");
+    assert!(message.contains("57321"), "unexpected message: {message}");
+    assert!(
+        message.contains("base_url"),
+        "unexpected message: {message}"
+    );
+    // 端口没起来就不该继续把 Codex 拉起来，否则它会连到没人监听的地址。
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("launch:"))
+    );
+}
+
+/// macOS 允许端口释放竞态的六秒重试；其他平台的浮动端口仍立即失败。
+#[tokio::test]
+async fn a_busy_floating_helper_port_respects_the_platform_retry_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone()).with_helper_bind_conflicts(u32::MAX);
+
+    let error = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58123,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("failed to bind helper runtime"));
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.starts_with("start-helper-busy:"))
+            .count(),
+        if cfg!(target_os = "macos") { 31 } else { 1 }
+    );
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("launch:"))
+    );
+}
+
+#[tokio::test]
+async fn pending_remote_control_recovery_runs_without_an_official_mix_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone()).with_pending_remote_control_session_recoveries();
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58123,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    handle.wait_for_codex_exit().await.unwrap();
+
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .contains(&"remote-control-session-recovery".to_string())
+    );
+}
+
+#[tokio::test]
+async fn official_mix_responses_profile_keeps_proxy_when_profile_switching_is_disabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
+        enhancements_enabled: false,
+        relay_profiles_enabled: false,
+        active_relay_id: "official-mix".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "official-mix".to_string(),
+            relay_mode: RelayMode::Official,
+            official_mix_api_key: true,
+            hide_official_usage_alert: false,
+            protocol: RelayProtocol::Responses,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    });
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58123,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    handle.wait_for_codex_exit().await.unwrap();
+
+    let events = events.lock().unwrap().clone();
+    assert!(events.contains(&"select-helper:58123".to_string()));
+    assert!(events.contains(&"start-helper:57321".to_string()));
+    assert!(events.contains(&"shutdown-helper:57321".to_string()));
+    assert!(!events.iter().any(|event| event.starts_with("inject:")));
 }
 
 #[tokio::test]
@@ -1904,6 +2194,8 @@ async fn launch_lifecycle_applies_aggregate_relay_before_provider_sync_and_launc
                 relay_id: "relay-a".to_string(),
                 weight: 1,
             }],
+            routes: Vec::new(),
+            session_provider: codex_plus_core::settings::RelaySessionProvider::default(),
         }],
         active_aggregate_relay_id: "aggregate".to_string(),
         ..BackendSettings::default()
@@ -1944,51 +2236,6 @@ async fn launch_lifecycle_applies_aggregate_relay_before_provider_sync_and_launc
     );
     assert!(apply_index < sync_index);
     assert!(sync_index < launch_index);
-}
-
-#[tokio::test]
-async fn launch_lifecycle_skips_protocol_proxy_relay_when_profiles_disabled() {
-    let temp = tempfile::tempdir().unwrap();
-    let app_dir = temp.path().join("Codex.app");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
-    let events = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
-        enhancements_enabled: false,
-        relay_profiles_enabled: false,
-        relay_profiles: vec![RelayProfile {
-            id: "relay-chat".to_string(),
-            name: "Chat Completions".to_string(),
-            protocol: RelayProtocol::ChatCompletions,
-            relay_mode: codex_plus_core::settings::RelayMode::MixedApi,
-            ..RelayProfile::default()
-        }],
-        active_relay_id: "relay-chat".to_string(),
-        ..BackendSettings::default()
-    });
-
-    let handle = launch_and_inject_with_hooks(
-        LaunchOptions {
-            app_dir: Some(app_dir),
-            debug_port: 9229,
-            helper_port: 57321,
-            status_store,
-        },
-        &hooks,
-    )
-    .await
-    .unwrap();
-    handle.wait_for_codex_exit().await.unwrap();
-
-    let events = events.lock().unwrap().clone();
-    assert!(!events.contains(&"apply-relay".to_string()));
-    assert!(!events.contains(&"computer-use-guard".to_string()));
-    assert!(
-        !events
-            .iter()
-            .any(|event| event.starts_with("start-helper:"))
-    );
-    assert!(events.contains(&"launch:9229".to_string()));
 }
 
 #[tokio::test]
@@ -2041,7 +2288,6 @@ experimental_bearer_token = "sk-test"
 
     let events = events.lock().unwrap().clone();
     assert!(events.contains(&"apply-relay".to_string()));
-    assert!(!events.contains(&"computer-use-guard".to_string()));
     assert!(events.contains(&"launch:9229".to_string()));
     let live_config = std::fs::read_to_string(hooks.codex_home.path().join("config.toml")).unwrap();
     assert_eq!(live_config.matches("[mcp_servers]").count(), 1);
@@ -2147,22 +2393,27 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
             protocol: RelayProtocol::ChatCompletions,
             relay_mode: codex_plus_core::settings::RelayMode::MixedApi,
             official_mix_api_key: false,
+            no_auth: false,
+            hide_official_usage_alert: false,
             test_model: String::new(),
             config_contents: String::new(),
             auth_contents: String::new(),
             use_common_config: true,
-            context_selection: codex_plus_core::settings::RelayContextSelection::default(),
-            context_selection_initialized: false,
             context_window: String::new(),
             auto_compact_limit: String::new(),
             model_insert_mode: codex_plus_core::settings::RelayModelInsertMode::default(),
             model_list: String::new(),
             model_windows: String::new(),
+            model_auto_compact: String::new(),
+            model_metadata: String::new(),
             model_vlm: String::new(),
             vlm_api_key: String::new(),
             vlm_model: String::new(),
             vlm_base_url: String::new(),
             user_agent: String::new(),
+            sub2api_enabled: false,
+            sub2api_multiplier: String::new(),
+            model_routes: Vec::new(),
         }],
         active_relay_id: "relay-chat".to_string(),
         ..BackendSettings::default()
@@ -2190,6 +2441,73 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
 
     let after_stop = events.lock().unwrap().clone();
     assert!(after_stop.contains(&"wait-codex".to_string()));
+    assert!(after_stop.contains(&"shutdown-helper:57321".to_string()));
+}
+
+#[tokio::test]
+async fn launch_starts_helper_when_model_routing_is_enabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let settings = BackendSettings {
+        enhancements_enabled: false,
+        active_relay_id: "source".to_string(),
+        relay_profiles: vec![
+            RelayProfile {
+                id: "source".to_string(),
+                name: "Source".to_string(),
+                base_url: "https://source.example.test/v1".to_string(),
+                api_key: "sk-source".to_string(),
+                model_routes: vec![RelayModelRoute {
+                    model: "gpt-5.6-luna".to_string(),
+                    target_relay_id: "target".to_string(),
+                    target_model: String::new(),
+                }],
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: "target".to_string(),
+                name: "Target".to_string(),
+                base_url: "https://target.example.test/v1".to_string(),
+                api_key: "sk-target".to_string(),
+                ..RelayProfile::default()
+            },
+        ],
+        ..BackendSettings::default()
+    };
+    let hooks = FakeHooks::new(events.clone()).with_settings(settings);
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58000,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    let before_stop = events.lock().unwrap().clone();
+    assert!(before_stop.contains(&"select-helper:58000".to_string()));
+    assert!(before_stop.contains(&"ensure-protocol-proxy-config".to_string()));
+    assert!(before_stop.contains(&"start-helper:57321".to_string()));
+    let ensure = before_stop
+        .iter()
+        .position(|event| event == "ensure-protocol-proxy-config")
+        .unwrap();
+    let start = before_stop
+        .iter()
+        .position(|event| event == "start-helper:57321")
+        .unwrap();
+    assert!(ensure < start);
+    assert!(!before_stop.contains(&"inject:9229:57321".to_string()));
+
+    handle.wait_for_codex_exit().await.unwrap();
+    let after_stop = events.lock().unwrap().clone();
     assert!(after_stop.contains(&"shutdown-helper:57321".to_string()));
 }
 
@@ -2348,6 +2666,30 @@ fn launcher_macos_cleanup_is_skipped_when_app_was_already_running() {
     );
 
     assert_eq!(command, None);
+}
+
+#[test]
+fn launcher_macos_debug_launch_starts_when_app_is_not_running() {
+    assert_eq!(
+        select_macos_debug_launch_action(false, false),
+        MacosDebugLaunchAction::LaunchNew
+    );
+}
+
+#[test]
+fn launcher_macos_debug_launch_reuses_existing_codex_cdp_instance() {
+    assert_eq!(
+        select_macos_debug_launch_action(true, true),
+        MacosDebugLaunchAction::ReuseRunningDebugApp
+    );
+}
+
+#[test]
+fn launcher_macos_debug_launch_restarts_existing_non_cdp_instance() {
+    assert_eq!(
+        select_macos_debug_launch_action(true, false),
+        MacosDebugLaunchAction::RestartRunningApp
+    );
 }
 
 #[tokio::test]
@@ -3066,6 +3408,9 @@ struct FakeHooks {
     probe_relay_lock_at_injection: bool,
     probe_relay_lock_after_injection: bool,
     codex_exited: bool,
+    has_pending_remote_control_session_recoveries: bool,
+    /// 还需要让 `start_helper` 报几次「端口被占用」，用来模拟旧 helper 尚未交还监听。
+    remaining_helper_bind_conflicts: Arc<Mutex<u32>>,
 }
 
 impl FakeHooks {
@@ -3095,6 +3440,8 @@ impl FakeHooks {
             probe_relay_lock_at_injection: false,
             probe_relay_lock_after_injection: false,
             codex_exited: false,
+            has_pending_remote_control_session_recoveries: false,
+            remaining_helper_bind_conflicts: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -3109,6 +3456,11 @@ impl FakeHooks {
     }
     fn with_codex_exited(mut self) -> Self {
         self.codex_exited = true;
+        self
+    }
+
+    fn with_helper_bind_conflicts(self, conflicts: u32) -> Self {
+        *self.remaining_helper_bind_conflicts.lock().unwrap() = conflicts;
         self
     }
 
@@ -3194,6 +3546,11 @@ impl FakeHooks {
         self
     }
 
+    fn with_pending_remote_control_session_recoveries(mut self) -> Self {
+        self.has_pending_remote_control_session_recoveries = true;
+        self
+    }
+
     fn event(&self, event: impl Into<String>) {
         self.events.lock().unwrap().push(event.into());
     }
@@ -3243,11 +3600,23 @@ impl LaunchHooks for FakeHooks {
         Ok(())
     }
 
+    fn has_pending_remote_control_session_recoveries(&self) -> bool {
+        self.has_pending_remote_control_session_recoveries
+    }
+
+    async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()> {
+        self.event("remote-control-session-recovery");
+        Ok(())
+    }
+
     async fn apply_active_relay_profile(
         &self,
         settings: &BackendSettings,
         codex_home: &Path,
     ) -> anyhow::Result<()> {
+        if !settings.relay_profiles_enabled {
+            return Ok(());
+        }
         self.event("apply-relay");
         *self.applied_relay_home.lock().unwrap() = Some(codex_home.to_path_buf());
         if self.live_relay_store.is_some() {
@@ -3272,8 +3641,11 @@ impl LaunchHooks for FakeHooks {
         Ok(())
     }
 
-    async fn ensure_computer_use_config(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
-        self.event("computer-use-guard");
+    async fn ensure_active_protocol_proxy_config(
+        &self,
+        _settings: &BackendSettings,
+    ) -> anyhow::Result<()> {
+        self.event("ensure-protocol-proxy-config");
         Ok(())
     }
 
@@ -3337,6 +3709,22 @@ impl LaunchHooks for FakeHooks {
     }
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+        {
+            let mut remaining = self.remaining_helper_bind_conflicts.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                self.event(format!("start-helper-busy:{helper_port}"));
+                // 与真实 `start_helper` 一样把 io::Error 包在 context 下面，
+                // 这样重试逻辑对错误链的判定也一并被测到。
+                return Err(anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "address already in use",
+                ))
+                .context(format!(
+                    "failed to bind helper runtime on 127.0.0.1:{helper_port}"
+                )));
+            }
+        }
         self.event(format!("start-helper:{helper_port}"));
         Ok(())
     }
@@ -3400,14 +3788,6 @@ impl LaunchHooks for FakeHooks {
         Ok(())
     }
 
-    async fn start_computer_use_guard_watchdog(
-        &self,
-        _settings: &BackendSettings,
-    ) -> anyhow::Result<()> {
-        self.event("computer-use-guard-watchdog");
-        Ok(())
-    }
-
     async fn write_status(&self, status: &str) {
         self.event(format!("status:{status}"));
     }
@@ -3416,7 +3796,11 @@ impl LaunchHooks for FakeHooks {
         !self.codex_exited
     }
 
-    async fn wait_for_codex_exit(&self, _launch: &CodexLaunch) -> anyhow::Result<()> {
+    async fn wait_for_codex_exit(
+        &self,
+        _launch: &CodexLaunch,
+        _debug_port: u16,
+    ) -> anyhow::Result<()> {
         self.event("wait-codex");
         if let Some(message) = &self.wait_error {
             anyhow::bail!(message.clone());

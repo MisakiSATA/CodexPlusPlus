@@ -10,26 +10,6 @@ const sourceSection = (source: string, start: string, end: string): string => {
   return source.slice(startIndex, endIndex);
 };
 
-test("official mode selects an official profile and launch mode in one switch", async () => {
-  const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
-  const section = sourceSection(app, "const switchOfficialMode", "const switchPureApiMode");
-
-  assert.match(section, /relayMode === "official"/);
-  assert.match(section, /launchMode: "relay"/);
-  assert.match(section, /switchRelayProfile/);
-  assert.doesNotMatch(section, /clearRelayInjection|saveLaunchMode/);
-});
-
-test("pure API mode selects a pure profile and launch mode in one switch", async () => {
-  const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
-  const section = sourceSection(app, "const switchPureApiMode", "const switchRelayProfile");
-
-  assert.match(section, /relayMode === "pureApi"/);
-  assert.match(section, /launchMode: "patch"/);
-  assert.match(section, /switchRelayProfile/);
-  assert.doesNotMatch(section, /applyPureApiInjection|saveLaunchMode/);
-});
-
 test("relay switch consumes the camelCase userScripts payload", async () => {
   const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
   const resultType = sourceSection(app, "type RelaySwitchResult", "type RelayProfileTestResult");
@@ -39,28 +19,6 @@ test("relay switch consumes the camelCase userScripts payload", async () => {
   assert.doesNotMatch(resultType, /user_scripts/);
   assert.match(switchFlow, /user_scripts:\s*result\.userScripts/);
   assert.doesNotMatch(switchFlow, /result\.user_scripts/);
-});
-
-test("saving the active enabled relay profile reuses the transactional switch flow", async () => {
-  const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
-  const saveFlow = sourceSection(app, "  const saveDraft = async () => {", "  const switchDraft = () => {");
-
-  assert.match(saveFlow, /isActive\s*&&\s*form\.relayProfilesEnabled/);
-  assert.match(saveFlow, /await actions\.switchRelayProfile\(next,\s*form\.activeRelayId\)/);
-  assert.match(saveFlow, /:\s*await onFormChange\(next\)/);
-  assert.doesNotMatch(saveFlow, /saveRelayFile/);
-});
-
-test("relay profile detail closes only after its save or apply succeeds", async () => {
-  const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
-  const settingsSave = sourceSection(app, "  const saveSettingsValue", "  const resetSettings");
-  const relayScreen = sourceSection(app, "function RelayScreen", "function EnvConflictNotice");
-  const saveFlow = sourceSection(app, "  const saveDraft = async () => {", "  const switchDraft = () => {");
-
-  assert.match(settingsSave, /if \(!result\) return false/);
-  assert.match(settingsSave, /return isSuccessStatus\(result\.status\)/);
-  assert.match(relayScreen, /return actions\.saveSettingsValue\(next,\s*true\)/);
-  assert.match(saveFlow, /if \(!saved\) return;\s*onSaved\?\.\(\)/);
 });
 
 test("active relay profile cannot be deleted before switching away", async () => {

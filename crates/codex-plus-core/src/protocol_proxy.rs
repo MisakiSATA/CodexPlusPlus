@@ -7,15 +7,17 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use anyhow::Context;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::relay_rotation::{RotationContext, RotationEvent};
 use crate::settings::{RelayProtocol, SettingsStore};
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
+pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
+const UPSTREAM_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -148,6 +150,11 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
     if let Some(input) = body.get("input") {
         append_responses_input(input, &mut messages);
     }
+    enforce_tool_call_pairing(&mut messages);
+    // 必须在 enforce_tool_call_pairing 之后：它依赖 tool 消息的连续性，
+    // 而这一步会往中间插入 user 消息。
+    relocate_tool_output_images(&mut messages);
+    ensure_tool_call_reasoning_content(&mut messages);
     normalize_chat_messages(&mut messages);
     let messages = collapse_system_messages_to_head(messages);
     result["messages"] = json!(messages);
@@ -295,6 +302,16 @@ pub enum UpstreamWireApi {
     Responses,
     ChatCompletions,
     AudioTranscriptions,
+    ImageGenerations,
+    ImageEdits,
+}
+
+#[derive(Debug, Clone)]
+struct ModelRouteSelection {
+    relay: crate::settings::RelayProfile,
+    source_relay_id: String,
+    source_model: String,
+    upstream_model: String,
 }
 
 impl UpstreamProxyResponse {
@@ -458,6 +475,17 @@ pub fn is_responses_proxy_path(path: &str) -> bool {
     )
 }
 
+pub fn is_responses_compact_proxy_path(path: &str) -> bool {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    matches!(
+        path,
+        "/responses/compact"
+            | "/v1/responses/compact"
+            | "/v1/v1/responses/compact"
+            | "/codex/v1/responses/compact"
+    )
+}
+
 pub fn is_chat_completions_proxy_path(path: &str) -> bool {
     let path = path.split_once('?').map_or(path, |(path, _)| path);
     matches!(
@@ -488,45 +516,117 @@ pub fn is_audio_transcriptions_proxy_path(path: &str) -> bool {
     )
 }
 
+pub fn is_image_generations_proxy_path(path: &str) -> bool {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    matches!(
+        path,
+        "/images/generations"
+            | "/v1/images/generations"
+            | "/v1/v1/images/generations"
+            | "/codex/v1/images/generations"
+    )
+}
+
+pub fn is_image_edits_proxy_path(path: &str) -> bool {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    matches!(
+        path,
+        "/images/edits" | "/v1/images/edits" | "/v1/v1/images/edits" | "/codex/v1/images/edits"
+    )
+}
+
 pub async fn open_responses_proxy_request(
     body: &str,
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_for_path(body, original_user_agent, "/responses").await
+}
+
+pub async fn open_responses_proxy_request_for_path(
+    body: &str,
+    original_user_agent: Option<&str>,
+    request_path: &str,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    open_responses_proxy_request_with_settings_and_user_agent(body, settings, original_user_agent)
-        .await
+    open_responses_proxy_request_with_settings_and_user_agent(
+        body,
+        settings,
+        original_user_agent,
+        request_path,
+    )
+    .await
 }
 
 pub async fn open_responses_proxy_request_with_settings(
     body: &str,
     settings: crate::settings::BackendSettings,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    open_responses_proxy_request_with_settings_and_user_agent(body, settings, None).await
+    open_responses_proxy_request_with_settings_and_user_agent(body, settings, None, "/responses")
+        .await
+}
+
+pub async fn open_responses_proxy_request_with_settings_for_path(
+    body: &str,
+    settings: crate::settings::BackendSettings,
+    request_path: &str,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_with_settings_and_user_agent(body, settings, None, request_path)
+        .await
 }
 
 async fn open_responses_proxy_request_with_settings_and_user_agent(
     body: &str,
     settings: crate::settings::BackendSettings,
     original_user_agent: Option<&str>,
+    request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    let request_json: Value = serde_json::from_str(body)?;
+    let mut request_json: Value = serde_json::from_str(body)?;
     let is_stream = request_json
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let source_model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let model_route = select_model_route(&settings, &source_model)?;
+    if let Some(route) = &model_route
+        && route.upstream_model != source_model
+    {
+        request_json["model"] = Value::String(route.upstream_model.clone());
+    }
+    let model = (!source_model.trim().is_empty()).then(|| source_model.clone());
     let context = RotationContext {
         conversation_id: conversation_id_from_responses_request(&request_json),
+        model,
     };
-    let relay = crate::relay_rotation::select_relay_for_request(&settings, context)?;
-    let mut relays = vec![relay.clone()];
-    relays.extend(crate::relay_rotation::fallback_relays_after(
-        &settings, &relay.id,
-    )?);
+    let (relay, relays) = if let Some(route) = &model_route {
+        (route.relay.clone(), vec![route.relay.clone()])
+    } else {
+        let relay = crate::relay_rotation::select_relay_for_request(&settings, context)?;
+        let mut relays = vec![relay.clone()];
+        relays.extend(crate::relay_rotation::fallback_relays_after(
+            &settings, &relay.id,
+        )?);
+        (relay, relays)
+    };
+    debug_assert_eq!(
+        relays.first().map(|item| item.id.as_str()),
+        Some(relay.id.as_str())
+    );
     let relay_count = relays.len();
     for (attempt, relay) in relays.into_iter().enumerate() {
         validate_upstream(&relay)?;
-        let (endpoint, upstream_body, wire_api) =
-            upstream_request_parts(&relay, request_json.clone()).await?;
+        let model_override = aggregate_upstream_model_override(&settings, &relay);
+        let (endpoint, upstream_body, wire_api) = upstream_request_parts(
+            &relay,
+            request_json.clone(),
+            request_path,
+            model_override.as_deref(),
+        )
+        .await?;
         let has_more_candidates = attempt + 1 < relay_count;
         let header_timeout = response_header_timeout(is_stream);
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -539,7 +639,13 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "stream": is_stream,
                 "attempt": attempt + 1,
                 "candidateCount": relay_count,
-                "headerTimeoutSeconds": header_timeout.as_secs()
+                "headerTimeoutSeconds": header_timeout.as_secs(),
+                "modelRoute": model_route.as_ref().map(|route| json!({
+                    "sourceRelayId": route.source_relay_id,
+                    "sourceModel": route.source_model,
+                    "targetRelayId": route.relay.id,
+                    "upstreamModel": route.upstream_model
+                }))
             }),
         );
         let upstream = match send_upstream_request_for_responses(
@@ -549,7 +655,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     original_user_agent,
                 ))?,
                 &endpoint,
-                relay.api_key.trim(),
+                &relay,
                 is_stream,
                 &upstream_body,
             ),
@@ -643,6 +749,62 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     anyhow::bail!("未找到可用的聚合供应商成员")
 }
 
+fn select_model_route(
+    settings: &crate::settings::BackendSettings,
+    model: &str,
+) -> anyhow::Result<Option<ModelRouteSelection>> {
+    if model.is_empty() || settings.active_aggregate_relay_profile().is_some() {
+        return Ok(None);
+    }
+
+    let source = settings.active_relay_profile();
+    let Some(route) = source
+        .model_routes
+        .iter()
+        .find(|route| route.model.trim() == model)
+    else {
+        return Ok(None);
+    };
+    let target_relay_id = route.target_relay_id.trim();
+    if target_relay_id == source.id {
+        anyhow::bail!("模型路由不能指向当前供应商自身：{model}");
+    }
+    let target = settings
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == target_relay_id)
+        .cloned()
+        .with_context(|| format!("模型路由目标供应商不存在：{target_relay_id}"))?;
+    if target.relay_mode == crate::settings::RelayMode::Aggregate {
+        anyhow::bail!("模型路由目标不能是聚合供应商：{}", target.name);
+    }
+    if target.protocol != RelayProtocol::Responses {
+        anyhow::bail!("模型路由目标必须使用 Responses API：{}", target.name);
+    }
+
+    let upstream_model = if route.target_model.trim().is_empty() {
+        model.to_string()
+    } else {
+        route.target_model.trim().to_string()
+    };
+    Ok(Some(ModelRouteSelection {
+        relay: target,
+        source_relay_id: source.id,
+        source_model: model.to_string(),
+        upstream_model,
+    }))
+}
+
+fn aggregate_upstream_model_override(
+    settings: &crate::settings::BackendSettings,
+    relay: &crate::settings::RelayProfile,
+) -> Option<String> {
+    settings.active_aggregate_relay_profile()?;
+    let model = crate::relay_config::relay_profile_model(relay);
+    let model = model.trim();
+    (!model.is_empty()).then(|| model.to_string())
+}
+
 pub async fn open_models_proxy_request(
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
@@ -660,15 +822,12 @@ pub async fn open_models_proxy_request(
             "wireApi": UpstreamWireApi::Responses
         }),
     );
-    let upstream = send_upstream_request(
-        crate::http_client::proxied_client(&effective_user_agent(
-            &relay.user_agent,
-            original_user_agent,
-        ))?
-        .get(endpoint)
-        .bearer_auth(relay.api_key.trim()),
-    )
-    .await?;
+    let request = crate::http_client::proxied_client(&effective_user_agent(
+        &relay.user_agent,
+        original_user_agent,
+    ))?
+    .get(endpoint);
+    let upstream = send_upstream_request(with_relay_auth(request, &relay)).await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
         .headers()
@@ -710,15 +869,143 @@ pub async fn open_audio_transcriptions_proxy_request(
             "bodyBytes": body.len()
         }),
     );
-    let upstream = send_upstream_request(
-        crate::http_client::proxied_client(&effective_user_agent(
-            &relay.user_agent,
-            original_user_agent,
-        ))?
-        .post(endpoint)
-        .bearer_auth(relay.api_key.trim())
-        .header(reqwest::header::CONTENT_TYPE, content_type)
-        .body(body.to_vec()),
+    let request = crate::http_client::proxied_client(&effective_user_agent(
+        &relay.user_agent,
+        original_user_agent,
+    ))?
+    .post(endpoint)
+    .header(reqwest::header::CONTENT_TYPE, content_type)
+    .body(body.to_vec());
+    let upstream = send_upstream_request(with_relay_auth(request, &relay)).await?;
+    let status_code = upstream.status().as_u16();
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json; charset=utf-8")
+        .to_string();
+
+    Ok(UpstreamProxyResponse {
+        status_code,
+        is_stream: false,
+        content_type,
+        wire_api: UpstreamWireApi::AudioTranscriptions,
+        response: upstream,
+    })
+}
+
+pub async fn open_image_generations_proxy_request(
+    body: &[u8],
+    original_user_agent: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    open_image_proxy_request(
+        body,
+        "application/json",
+        original_user_agent,
+        ImageProxyEndpoint::Generations,
+    )
+    .await
+}
+
+pub async fn open_image_edits_proxy_request(
+    body: &[u8],
+    content_type: &str,
+    original_user_agent: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    open_image_proxy_request(
+        body,
+        content_type,
+        original_user_agent,
+        ImageProxyEndpoint::Edits,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ImageProxyEndpoint {
+    Generations,
+    Edits,
+}
+
+impl ImageProxyEndpoint {
+    fn url(self, base_url: &str) -> String {
+        match self {
+            Self::Generations => image_generations_url(base_url),
+            Self::Edits => image_edits_url(base_url),
+        }
+    }
+
+    fn wire_api(self) -> UpstreamWireApi {
+        match self {
+            Self::Generations => UpstreamWireApi::ImageGenerations,
+            Self::Edits => UpstreamWireApi::ImageEdits,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Generations => "image_generations",
+            Self::Edits => "image_edits",
+        }
+    }
+}
+
+async fn open_image_proxy_request(
+    body: &[u8],
+    content_type: &str,
+    original_user_agent: Option<&str>,
+    endpoint_kind: ImageProxyEndpoint,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
+    let base_url = if relay.upstream_base_url.trim().is_empty() {
+        crate::relay_config::relay_profile_base_url(&relay)
+    } else {
+        relay.upstream_base_url.trim().to_string()
+    };
+    if is_local_protocol_proxy_base_url(&base_url) {
+        anyhow::bail!("图片上游 Base URL 不能指向本地协议代理");
+    }
+    if base_url.trim().is_empty() {
+        anyhow::bail!("图片上游 Base URL 不能为空");
+    }
+    if relay.api_key.trim().is_empty() && !relay.uses_no_auth() {
+        anyhow::bail!("图片上游 Key 不能为空");
+    }
+    let content_type = content_type.trim();
+    let content_type = if content_type.is_empty() {
+        match endpoint_kind {
+            ImageProxyEndpoint::Generations => "application/json",
+            ImageProxyEndpoint::Edits => {
+                anyhow::bail!("图片 edits 请求缺少 Content-Type");
+            }
+        }
+    } else {
+        content_type
+    };
+    let endpoint = endpoint_kind.url(&base_url);
+    let wire_api = endpoint_kind.wire_api();
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.image_request",
+        json!({
+            "relayId": relay.id,
+            "relayName": relay.name,
+            "endpoint": endpoint,
+            "wireApi": wire_api,
+            "bodyBytes": body.len(),
+            "endpointKind": endpoint_kind.name()
+        }),
+    );
+    let request = crate::http_client::proxied_client(&effective_user_agent(
+        &relay.user_agent,
+        original_user_agent,
+    ))?
+    .post(endpoint)
+    .header(reqwest::header::CONTENT_TYPE, content_type)
+    .body(body.to_vec());
+    let upstream = send_upstream_request_with_header_timeout(
+        with_relay_auth(request, &relay),
+        UPSTREAM_IMAGE_HEADER_TIMEOUT,
     )
     .await?;
     let status_code = upstream.status().as_u16();
@@ -733,7 +1020,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         status_code,
         is_stream: false,
         content_type,
-        wire_api: UpstreamWireApi::AudioTranscriptions,
+        wire_api,
         response: upstream,
     })
 }
@@ -758,7 +1045,7 @@ pub async fn open_chat_completions_proxy_request(
     if relay.base_url.trim().is_empty() {
         anyhow::bail!("Chat Completions 上游 Base URL 不能为空");
     }
-    if relay.api_key.trim().is_empty() {
+    if relay.api_key.trim().is_empty() && !relay.uses_no_auth() {
         anyhow::bail!("Chat Completions 上游 Key 不能为空");
     }
 
@@ -767,16 +1054,14 @@ pub async fn open_chat_completions_proxy_request(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let upstream = crate::http_client::proxied_client(&effective_user_agent(
+    let request = crate::http_client::proxied_client(&effective_user_agent(
         &relay.user_agent,
         original_user_agent,
     ))?
     .post(chat_completions_url(&relay.base_url))
-    .bearer_auth(relay.api_key.trim())
     .header(reqwest::header::CONTENT_TYPE, "application/json")
-    .json(&request_json)
-    .send()
-    .await?;
+    .json(&request_json);
+    let upstream = with_relay_auth(request, &relay).send().await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
         .headers()
@@ -796,12 +1081,27 @@ pub async fn open_chat_completions_proxy_request(
 
 async fn upstream_request_parts(
     relay: &crate::settings::RelayProfile,
-    request_json: Value,
+    mut request_json: Value,
+    request_path: &str,
+    model_override: Option<&str>,
 ) -> anyhow::Result<(String, Value, UpstreamWireApi)> {
+    let compact = is_responses_compact_proxy_path(request_path);
+    if compact && relay.protocol == RelayProtocol::ChatCompletions {
+        anyhow::bail!("Chat Completions 协议暂不支持 Responses compact 请求");
+    }
+    if let Some(model) = model_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        request_json["model"] = json!(model);
+    }
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
         RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
     };
+    if relay.protocol == RelayProtocol::Responses {
+        normalize_responses_item_ids(&mut body);
+    }
 
     // Image handling (per-model): send-as-is / strip / VLM analysis
     let model = body
@@ -839,6 +1139,7 @@ async fn upstream_request_parts(
                                 &relay.model_windows,
                                 &relay.context_window,
                                 &model,
+                                relay.protocol == crate::settings::RelayProtocol::Responses,
                             )
                             .await;
                         }
@@ -848,12 +1149,21 @@ async fn upstream_request_parts(
         }
     }
 
+    if guard_inline_image_data_urls(&mut body) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "inline_image_data_url_leak",
+            json!({ "model": model, "protocol": format!("{:?}", relay.protocol) }),
+        );
+        debug_assert!(false, "base64 图片泄漏进文本字段，检查协议转换路径");
+    }
+
     let wire_api = match relay.protocol {
         RelayProtocol::Responses => UpstreamWireApi::Responses,
         RelayProtocol::ChatCompletions => UpstreamWireApi::ChatCompletions,
     };
     Ok((
         match relay.protocol {
+            RelayProtocol::Responses if compact => responses_compact_url(&relay.base_url),
             RelayProtocol::Responses => responses_url(&relay.base_url),
             RelayProtocol::ChatCompletions => chat_completions_url(&relay.base_url),
         },
@@ -865,14 +1175,14 @@ async fn upstream_request_parts(
 fn upstream_request_builder(
     client: reqwest::Client,
     endpoint: &str,
-    api_key: &str,
+    relay: &crate::settings::RelayProfile,
     is_stream: bool,
     upstream_body: &Value,
 ) -> reqwest::RequestBuilder {
     let mut builder = client
         .post(endpoint)
-        .bearer_auth(api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json");
+    builder = with_relay_auth(builder, relay);
     if is_stream {
         builder = builder
             .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -885,10 +1195,21 @@ fn validate_upstream(relay: &crate::settings::RelayProfile) -> anyhow::Result<()
     if relay.base_url.trim().is_empty() {
         anyhow::bail!("上游 Base URL 不能为空");
     }
-    if relay.api_key.trim().is_empty() {
+    if relay.api_key.trim().is_empty() && !relay.uses_no_auth() {
         anyhow::bail!("上游 Key 不能为空");
     }
     Ok(())
+}
+
+fn with_relay_auth(
+    request: reqwest::RequestBuilder,
+    relay: &crate::settings::RelayProfile,
+) -> reqwest::RequestBuilder {
+    if relay.uses_no_auth() {
+        request
+    } else {
+        request.bearer_auth(relay.api_key.trim())
+    }
 }
 
 fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
@@ -1004,6 +1325,14 @@ pub fn responses_url(base_url: &str) -> String {
     url
 }
 
+pub fn responses_compact_url(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
+    if base.to_ascii_lowercase().ends_with("/responses/compact") {
+        return base.to_string();
+    }
+    format!("{}/compact", responses_url(base_url).trim_end_matches('/'))
+}
+
 pub fn audio_transcriptions_url(base_url: &str) -> String {
     let skip_version_prefix = base_url.trim().ends_with('#');
     let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
@@ -1022,6 +1351,85 @@ pub fn audio_transcriptions_url(base_url: &str) -> String {
         url = url.replace("/v1/v1", "/v1");
     }
     url
+}
+
+pub fn image_generations_url(base_url: &str) -> String {
+    image_endpoint_url(base_url, "generations")
+}
+
+pub fn image_edits_url(base_url: &str) -> String {
+    image_endpoint_url(base_url, "edits")
+}
+
+fn image_endpoint_url(base_url: &str, endpoint: &str) -> String {
+    let skip_version_prefix = base_url.trim().ends_with('#');
+    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
+    if base
+        .to_ascii_lowercase()
+        .ends_with(&format!("/images/{endpoint}"))
+    {
+        return base.to_string();
+    }
+    let origin_only = base
+        .split_once("://")
+        .map_or(!base.contains('/'), |(_, rest)| !rest.contains('/'));
+    let mut url = if skip_version_prefix || has_version_suffix(base) || !origin_only {
+        format!("{base}/images/{endpoint}")
+    } else {
+        format!("{base}/v1/images/{endpoint}")
+    };
+    while url.contains("/v1/v1") {
+        url = url.replace("/v1/v1", "/v1");
+    }
+    url
+}
+
+fn is_local_protocol_proxy_base_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    if !url.scheme().eq_ignore_ascii_case("http") || url.port() != Some(DEFAULT_PROTOCOL_PROXY_PORT)
+    {
+        return false;
+    }
+    matches!(
+        url.host_str(),
+        Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+    )
+}
+
+#[cfg(test)]
+mod image_proxy_tests {
+    use super::UPSTREAM_IMAGE_HEADER_TIMEOUT;
+    use super::is_local_protocol_proxy_base_url;
+    use std::time::Duration;
+
+    #[test]
+    fn image_requests_allow_ten_minutes_for_response_headers() {
+        assert_eq!(UPSTREAM_IMAGE_HEADER_TIMEOUT, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn local_protocol_proxy_detection_covers_common_loopback_forms() {
+        for base_url in [
+            "http://127.0.0.1:57321",
+            "http://127.0.0.1:57321/",
+            "http://127.0.0.1:57321/v1",
+            "http://localhost:57321/v1/",
+            "http://[::1]:57321/v1",
+        ] {
+            assert!(is_local_protocol_proxy_base_url(base_url), "{base_url}");
+        }
+
+        for base_url in [
+            "https://127.0.0.1:57321/v1",
+            "http://127.0.0.1:57322/v1",
+            "http://api.example.test:57321/v1",
+            "not-a-url",
+        ] {
+            assert!(!is_local_protocol_proxy_base_url(base_url), "{base_url}");
+        }
+    }
 }
 
 pub fn models_url(base_url: &str) -> String {
@@ -1080,6 +1488,15 @@ pub fn response_id_from_chat_id(id: Option<&str>) -> String {
     } else {
         format!("resp_{id}")
     }
+}
+
+/// `resp_xxx` → `xxx`。message item 的 id 必须以 `msg_` 开头，
+/// 直接拼在 `response_id` 后面会得到上游拒收的 `resp_xxx_msg`（#1431）。
+fn response_id_body(response_id: &str) -> &str {
+    response_id
+        .strip_prefix("resp_")
+        .filter(|value| !value.is_empty())
+        .unwrap_or(response_id)
 }
 
 fn push_sse(output: &mut String, event: &str, data: Value) {
@@ -1388,7 +1805,7 @@ impl ChatSseState {
     fn push_text_delta_into(&mut self, delta: &str, output: &mut String) {
         if !self.text.added {
             let output_index = self.next_output_index();
-            let item_id = format!("{}_msg", self.response_id);
+            let item_id = format!("msg_{}", response_id_body(&self.response_id));
             self.text.output_index = Some(output_index);
             self.text.item_id = item_id.clone();
             self.text.added = true;
@@ -1471,7 +1888,17 @@ impl ChatSseState {
                 state.arguments.push_str(&args_delta);
             }
 
-            if !state.added && (!state.call_id.is_empty() || !state.name.is_empty()) {
+            // Custom tool output items must use the `ctc_` ID namespace. Some
+            // Chat Completions providers send the call ID before the function
+            // name, so wait for the name when the request includes custom tools
+            // instead of emitting a provisional `function_call` with an `fc_`
+            // ID that cannot later be replayed as a `custom_tool_call`.
+            let waiting_for_custom_tool_name =
+                self.tool_context.has_custom_tools && state.name.is_empty();
+            if !state.added
+                && (!state.call_id.is_empty() || !state.name.is_empty())
+                && !waiting_for_custom_tool_name
+            {
                 should_add = true;
                 pending_arguments = state.arguments.clone();
             } else if state.added {
@@ -1491,7 +1918,7 @@ impl ChatSseState {
                 state.name = "unknown_tool".to_string();
             }
             state.output_index = Some(assigned);
-            state.item_id = format!("fc_{}", state.call_id);
+            state.item_id = tool_call_item_id(&state.call_id, &state.name, &self.tool_context);
             let added_item = tool_call_added_item(state, assigned, &self.tool_context);
             push_sse(output, "response.output_item.added", added_item);
             if !pending_arguments.is_empty() {
@@ -1674,7 +2101,7 @@ impl ChatSseState {
                     state.name = "unknown_tool".to_string();
                 }
                 state.output_index = Some(assigned);
-                state.item_id = format!("fc_{}", state.call_id);
+                state.item_id = tool_call_item_id(&state.call_id, &state.name, &self.tool_context);
                 let added_item = tool_call_added_item(state, assigned, &self.tool_context);
                 push_sse(output, "response.output_item.added", added_item);
             }
@@ -1915,6 +2342,90 @@ fn truncate_error_preview(input: &str) -> String {
     input.chars().take(ERROR_BODY_PREVIEW_LIMIT).collect()
 }
 
+/// Responses 协议要求每个 input item 的 `id` 前缀与它的 `type` 对应，
+/// 例如 `message` 必须是 `msg_`、`function_call` 必须是 `fc_`。
+/// 前缀不匹配时上游直接以 `[ApiIdParam] [input[N].id] [invalid_id_prefix]` 拒绝**整份**请求，
+/// 于是这段历史被反复重放、会话永久不可用（#1431 / #1781 / #1796）。
+///
+/// 前缀表取自 Codex 自己的 rollout 记录（`~/.codex/sessions/**/rollout-*.jsonl`），
+/// 不是猜测：`message`/`reasoning`/`custom_tool_call`/`custom_tool_call_output`/
+/// `function_call`/`function_call_output` 分别对应 msg_/rs_/ctc_/ctco_/fc_/fco_。
+const RESPONSES_ITEM_ID_PREFIXES: &[(&str, &str)] = &[
+    ("message", "msg_"),
+    ("reasoning", "rs_"),
+    ("function_call", "fc_"),
+    ("function_call_output", "fco_"),
+    ("custom_tool_call", "ctc_"),
+    ("custom_tool_call_output", "ctco_"),
+];
+
+/// 供集成测试直接验证前缀归一结果：`upstream_request_parts` 需要真实网络，
+/// 用它测不方便。
+#[doc(hidden)]
+pub fn normalize_responses_item_ids_for_test(body: &mut Value) {
+    normalize_responses_item_ids(body);
+}
+
+/// 出站前把所有已知 item 的 id 前缀修正到与 `type` 一致。
+///
+/// 只认前缀表里的类型，未知类型原样通过——宁可放过，也不要把看不出类型语义的 id 改坏。
+fn normalize_responses_item_ids(body: &mut Value) {
+    let Some(input) = body.get_mut("input") else {
+        return;
+    };
+    match input {
+        Value::Array(items) => {
+            for item in items {
+                normalize_responses_item_id(item);
+            }
+        }
+        Value::Object(_) => normalize_responses_item_id(input),
+        _ => {}
+    }
+}
+
+fn normalize_responses_item_id(item: &mut Value) {
+    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    let Some((_, prefix)) = RESPONSES_ITEM_ID_PREFIXES
+        .iter()
+        .find(|(kind, _)| *kind == item_type)
+    else {
+        return;
+    };
+    let Some(id) = item.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    // 只有「前缀 + 非空后缀」才算已经合规。id 恰好等于前缀本身（`fc_`）是空壳，
+    // 放它过去会直接触发上游的 invalid_id_prefix，所以落到下面按 call_id 重建。
+    if id.len() > prefix.len() && id.starts_with(prefix) {
+        return;
+    }
+    // 剥掉 id 上现有的前缀再换新的。取**最长**匹配：`fc_` 是 `fco_` 的前缀，
+    // 先撞上短的会把 `fco_call_a` 剥成 `call_a` 再换成 `fc_call_a`，
+    // 把 function_call_output 错改成 function_call。
+    // `item_` 是历史版本 Codex++ 自己造的前缀；`resp_` 来自历史版本把 message
+    // item 命名成 `{response_id}_msg`（#1431 / #1781），都要一并剥掉。
+    let suffix = ["item_", "resp_"]
+        .into_iter()
+        .chain(RESPONSES_ITEM_ID_PREFIXES.iter().map(|(_, known)| *known))
+        .filter_map(|known| id.strip_prefix(known).map(|rest| (known.len(), rest)))
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, rest)| rest)
+        .unwrap_or(id);
+    // 剥完是空串说明 id 恰好只由某个前缀组成，退回 call_id，再退回原 id。
+    let suffix = if suffix.is_empty() {
+        item.get("call_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(id)
+    } else {
+        suffix
+    };
+    item["id"] = json!(format!("{prefix}{suffix}"));
+}
+
 fn append_responses_input(input: &Value, messages: &mut Vec<Value>) {
     match input {
         Value::String(text) => messages.push(json!({ "role": "user", "content": text })),
@@ -2001,7 +2512,7 @@ fn append_responses_item(
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": response_output_text(item.get("output").unwrap_or(&Value::Null))
+                "content": tool_output_content(item.get("output").unwrap_or(&Value::Null))
             }));
         }
         Some("custom_tool_call") => {
@@ -2047,7 +2558,7 @@ fn append_responses_item(
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": response_output_text(item.get("output").unwrap_or(&Value::Null))
+                "content": tool_output_content(item.get("output").unwrap_or(&Value::Null))
             }));
         }
         Some("tool_call") => {
@@ -2093,7 +2604,7 @@ fn append_responses_item(
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": response_output_text(output)
+                "content": tool_output_content(output)
             }));
         }
         Some("reasoning") => {
@@ -2105,14 +2616,14 @@ fn append_responses_item(
         }
         _ => {
             flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
-            if item.get("role").is_some() || item.get("content").is_some() {
+            if let Some(content) = item.get("content") {
                 let role = responses_role_to_chat_role(item.get("role").and_then(Value::as_str));
+                if content.is_null() && role != "assistant" {
+                    return;
+                }
                 let mut message = json!({
                     "role": role,
-                    "content": responses_content_to_chat_content(
-                        role,
-                        item.get("content").unwrap_or(&Value::Null)
-                        )
+                    "content": responses_content_to_chat_content(role, content)
                 });
                 if role == "assistant" {
                     if !pending_reasoning.is_empty() && pending_tool_calls.is_empty() {
@@ -2130,6 +2641,15 @@ fn append_responses_item(
 }
 
 fn orphan_tool_output_message(call_id: &str, output: &Value) -> Value {
+    // 这条已经是 user 消息，multi-part 图片可以直接内联，不必走 relocate。
+    if let Value::Array(parts) = tool_output_content(output) {
+        let mut content = vec![json!({
+            "type": "text",
+            "text": format!("Function call output ({call_id}):")
+        })];
+        content.extend(parts);
+        return json!({ "role": "user", "content": content });
+    }
     json!({
         "role": "user",
         "content": format!(
@@ -2137,6 +2657,216 @@ fn orphan_tool_output_message(call_id: &str, output: &Value) -> Value {
             response_output_text(output)
         )
     })
+}
+
+/// Chat Completions 上游（DeepSeek thinking 模式尤其严格）要求带 `tool_calls` 的
+/// assistant 消息后面必须紧跟每个 `tool_call_id` 对应的 `tool` 消息。中断/回滚过的
+/// 一轮会话可能留下没有 output 的 `function_call`，直接转发会被上游 400
+/// （insufficient tool messages following tool_calls message）。
+///
+/// 这里把没有配对 output 的 tool_call 从消息里摘掉，降级成文本保留在历史中，
+/// 避免丢失「模型曾试图调用某工具」这一信息。
+fn enforce_tool_call_pairing(messages: &mut [Value]) {
+    let mut index = 0;
+    while index < messages.len() {
+        if messages[index].get("role").and_then(Value::as_str) != Some("assistant") {
+            index += 1;
+            continue;
+        }
+        let Some(tool_calls) = messages[index].get("tool_calls").and_then(Value::as_array) else {
+            index += 1;
+            continue;
+        };
+        if tool_calls.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        // 收集紧跟其后的 tool 消息所应答的 id
+        let mut answered = BTreeSet::new();
+        let mut followers = 0;
+        for message in messages[index + 1..]
+            .iter()
+            .take_while(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        {
+            followers += 1;
+            if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+                answered.insert(id.to_string());
+            }
+        }
+
+        // 位于历史尾部的 tool_call 是「刚发起、output 还没回来」的正常形态，
+        // 上游本就期待它；只有序列越过了它却没应答才是非法的。
+        if index + 1 + followers >= messages.len() {
+            index += 1;
+            continue;
+        }
+
+        let (kept, orphaned): (Vec<Value>, Vec<Value>) =
+            tool_calls.iter().cloned().partition(|tool_call| {
+                tool_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| answered.contains(id))
+            });
+        if orphaned.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        let notes = orphaned
+            .iter()
+            .map(|tool_call| {
+                let name = tool_call
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let id = tool_call.get("id").and_then(Value::as_str).unwrap_or("");
+                format!("Abandoned function call ({id}): {name}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if kept.is_empty() {
+            if let Some(message) = messages[index].as_object_mut() {
+                message.remove("tool_calls");
+            }
+        } else {
+            messages[index]["tool_calls"] = json!(kept);
+        }
+        append_text_to_assistant_message(&mut messages[index], &notes);
+        index += 1;
+    }
+}
+
+/// `role:"tool"` 消息在多数 Chat Completions 上游（DeepSeek 在内）只接受字符串 content，
+/// 塞 multi-part `image_url` 会被 400；而 `enforce_tool_call_pairing` 又要求 tool 消息
+/// 紧跟在 assistant(tool_calls) 之后**连续**排列 —— 把图片消息插在两条 tool 消息中间，
+/// 会让后面那条不再被计入 followers，对应的 tool_call 被误判成 orphaned 而摘掉。
+///
+/// 两个约束都要满足，所以这里的做法是：tool 消息本身降级成文本占位，图片一路收集到
+/// 连续 tool 区结束，再作为一条 user 消息整体插在其后。
+fn relocate_tool_output_images(messages: &mut Vec<Value>) {
+    let mut index = 0;
+    while index < messages.len() {
+        if messages[index].get("role").and_then(Value::as_str) != Some("tool") {
+            index += 1;
+            continue;
+        }
+        let mut images = Vec::new();
+        let mut end = index;
+        while end < messages.len()
+            && messages[end].get("role").and_then(Value::as_str) == Some("tool")
+        {
+            take_images_from_tool_message(&mut messages[end], &mut images);
+            end += 1;
+        }
+        if !images.is_empty() {
+            let mut content = vec![json!({
+                "type": "text",
+                "text": "Images returned by the tool call(s) above:"
+            })];
+            content.append(&mut images);
+            messages.insert(end, json!({ "role": "user", "content": content }));
+            end += 1;
+        }
+        index = end;
+    }
+}
+
+/// 摘掉单条 tool 消息里的图片块，content 降级为纯文本。
+/// 没有文本时补占位符 —— 空字符串 content 会被部分上游拒绝。
+fn take_images_from_tool_message(message: &mut Value, images: &mut Vec<Value>) {
+    let Some(parts) = message.get("content").and_then(Value::as_array) else {
+        return;
+    };
+
+    let mut texts = Vec::new();
+    let mut found = Vec::new();
+    for part in parts {
+        if is_image_part(part) {
+            if let Some(image) = image_part_to_chat(part) {
+                found.push(image);
+            }
+            continue;
+        }
+        if let Some(text) = part.get("text").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            texts.push(text.to_string());
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+
+    let placeholder = if found.len() == 1 {
+        "[image]".to_string()
+    } else {
+        format!("[{} images]", found.len())
+    };
+    message["content"] = json!(if texts.is_empty() {
+        placeholder
+    } else {
+        format!("{}\n{placeholder}", texts.join("\n"))
+    });
+    images.append(&mut found);
+}
+
+fn append_text_to_assistant_message(message: &mut Value, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let existing = match message.get("content") {
+        Some(Value::String(content)) => content.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    };
+    message["content"] = if existing.trim().is_empty() {
+        json!(text)
+    } else {
+        json!(format!("{existing}\n{text}"))
+    };
+}
+
+/// DeepSeek thinking 模式要求带 `tool_calls` 的 assistant 消息回传 `reasoning_content`，
+/// 否则报 400（The `reasoning_content` in the thinking mode must be passed back to the API）。
+/// 历史里没有 reasoning 项时（例如上游没回传 summary，或被裁剪掉了）补一个占位说明，
+/// 只补 content 和 reasoning_content 同时为空的情况，不覆盖真实 reasoning。
+fn ensure_tool_call_reasoning_content(messages: &mut [Value]) {
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let has_tool_calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|tool_calls| !tool_calls.is_empty());
+        if !has_tool_calls {
+            continue;
+        }
+        let has_content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.trim().is_empty());
+        let has_reasoning = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .is_some_and(|reasoning| !reasoning.trim().is_empty());
+        if has_content || has_reasoning {
+            continue;
+        }
+        message["reasoning_content"] = json!("Calling the requested tool.");
+    }
 }
 
 fn normalize_chat_messages(messages: &mut [Value]) {
@@ -2292,6 +3022,37 @@ fn responses_reasoning_text(item: &Value) -> Option<String> {
     extract_reasoning_summary_text(item).or_else(|| extract_reasoning_field_text(item))
 }
 
+fn is_image_part(part: &Value) -> bool {
+    matches!(
+        part.get("type").and_then(Value::as_str),
+        Some("input_image") | Some("image_url")
+    )
+}
+
+/// 把 Responses 的 `input_image`（`image_url` 可能是裸字符串）与已经是 Chat 形态的
+/// `image_url` 统一成 Chat Completions 的 `{"type":"image_url","image_url":{"url":…}}`。
+///
+/// 返回 `None` 表示这不是图片块、或 url 为空不值得转发。
+fn image_part_to_chat(part: &Value) -> Option<Value> {
+    if !is_image_part(part) {
+        return None;
+    }
+    let raw = part.get("image_url")?;
+    let image_url = if raw.is_object() {
+        raw.clone()
+    } else {
+        json!({ "url": raw.as_str().unwrap_or_default() })
+    };
+    if image_url
+        .get("url")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return None;
+    }
+    Some(json!({ "type": "image_url", "image_url": image_url }))
+}
+
 fn responses_content_to_chat_content(_role: &str, content: &Value) -> Value {
     if content.is_null() || content.is_string() {
         return content.clone();
@@ -2319,14 +3080,9 @@ fn responses_content_to_chat_content(_role: &str, content: &Value) -> Value {
                     }
                 }
             }
-            "input_image" => {
-                if let Some(image_url) = part.get("image_url") {
-                    let image_url = if image_url.is_object() {
-                        image_url.clone()
-                    } else {
-                        json!({ "url": image_url.as_str().unwrap_or_default() })
-                    };
-                    chat_parts.push(json!({ "type": "image_url", "image_url": image_url }));
+            "input_image" | "image_url" => {
+                if let Some(image) = image_part_to_chat(part) {
+                    chat_parts.push(image);
                     has_non_text_part = true;
                 }
             }
@@ -2669,16 +3425,120 @@ fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
     } else {
         json!({})
     };
-    if normalized.get("type").is_none() {
-        normalized["type"] = json!("object");
+    // 裸 `$ref` 已经是完整 schema，补默认字段会人为制造 sibling。
+    let is_bare_ref = normalized
+        .as_object()
+        .is_some_and(|object| object.len() == 1 && object.contains_key("$ref"));
+    if !is_bare_ref {
+        if normalized.get("type").is_none() {
+            normalized["type"] = json!("object");
+        }
+        if normalized.get("properties").is_none() {
+            normalized["properties"] = json!({});
+        }
+        if normalized.get("required").is_none() {
+            normalized["required"] = json!([]);
+        }
     }
-    if normalized.get("properties").is_none() {
-        normalized["properties"] = json!({});
+    inline_ref_siblings(&normalized)
+}
+
+fn inline_ref_siblings(root: &Value) -> Value {
+    let defs = root.get("$defs").and_then(Value::as_object);
+    let mut resolving = Vec::new();
+    normalize_schema_value(root, defs, &mut resolving).unwrap_or_else(|_| root.clone())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRefNormalizationError {
+    Cycle,
+}
+
+fn normalize_schema_value(
+    node: &Value,
+    defs: Option<&Map<String, Value>>,
+    resolving: &mut Vec<String>,
+) -> Result<Value, LocalRefNormalizationError> {
+    match node {
+        Value::Array(items) => Ok(Value::Array(
+            items
+                .iter()
+                .map(|item| normalize_schema_value(item, defs, resolving))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        Value::Object(object) => normalize_schema_object(object, defs, resolving),
+        _ => Ok(node.clone()),
     }
-    if normalized.get("required").is_none() {
-        normalized["required"] = json!([]);
+}
+
+fn normalize_schema_object(
+    object: &Map<String, Value>,
+    defs: Option<&Map<String, Value>>,
+    resolving: &mut Vec<String>,
+) -> Result<Value, LocalRefNormalizationError> {
+    if object.len() > 1
+        && let Some(reference) = object.get("$ref").and_then(Value::as_str)
+        && let Some(name) = local_definition_name(reference)
+    {
+        match resolve_local_definition(name, defs, resolving)? {
+            Some(Value::Object(mut merged)) if merged.get("$ref").is_none() => {
+                for (key, value) in object {
+                    if key != "$ref" {
+                        merged.insert(key.clone(), normalize_schema_value(value, defs, resolving)?);
+                    }
+                }
+                return Ok(Value::Object(merged));
+            }
+            Some(_) | None => {}
+        }
     }
-    normalized
+
+    let mut normalized = Map::new();
+    for (key, value) in object {
+        normalized.insert(key.clone(), normalize_schema_value(value, defs, resolving)?);
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn resolve_local_definition(
+    name: &str,
+    defs: Option<&Map<String, Value>>,
+    resolving: &mut Vec<String>,
+) -> Result<Option<Value>, LocalRefNormalizationError> {
+    let Some(defs) = defs else {
+        return Ok(None);
+    };
+    let Some(target) = defs.get(name) else {
+        return Ok(None);
+    };
+    if resolving.iter().any(|current| current == name) {
+        return Err(LocalRefNormalizationError::Cycle);
+    }
+
+    resolving.push(name.to_string());
+    let resolved = if let Some(alias) = bare_local_ref_name(target) {
+        resolve_local_definition(alias, Some(defs), resolving)
+    } else {
+        normalize_schema_value(target, Some(defs), resolving).map(Some)
+    };
+    resolving.pop();
+    resolved
+}
+
+fn bare_local_ref_name(node: &Value) -> Option<&str> {
+    let object = node.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    local_definition_name(object.get("$ref")?.as_str()?)
+}
+
+fn local_definition_name(reference: &str) -> Option<&str> {
+    let name = reference.strip_prefix("#/$defs/")?;
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(name)
 }
 
 fn generic_custom_proxy_tool(name: &str, description: &str) -> Value {
@@ -3043,7 +3903,7 @@ fn chat_message_to_response_output_item(message: &Value, response_id: &str) -> O
     }
 
     Some(json!({
-        "id": format!("{response_id}_msg"),
+        "id": format!("msg_{}", response_id_body(response_id)),
         "type": "message",
         "status": "completed",
         "role": "assistant",
@@ -3118,7 +3978,7 @@ fn tool_call_added_item(
             "type": "response.output_item.added",
             "output_index": output_index,
             "item": {
-                "id": format!("ctc_{}", state.call_id),
+                "id": tool_call_item_id(&state.call_id, &state.name, tool_context),
                 "type": "custom_tool_call",
                 "status": "in_progress",
                 "call_id": state.call_id,
@@ -3181,7 +4041,7 @@ fn push_tool_call_done_sse(
             "response.custom_tool_call_input.delta",
             json!({
                 "type": "response.custom_tool_call_input.delta",
-                "item_id": format!("ctc_{}", state.call_id),
+                "item_id": tool_call_item_id(&state.call_id, &state.name, tool_context),
                 "call_id": state.call_id,
                 "output_index": output_index,
                 "delta": reconstruct_custom_tool_call_input_with_context(
@@ -3217,7 +4077,7 @@ fn response_tool_call_item(
 ) -> Value {
     if tool_context.is_custom_tool_proxy(name) {
         return json!({
-            "id": format!("ctc_{call_id}"),
+            "id": tool_call_item_id(call_id, name, tool_context),
             "type": "custom_tool_call",
             "status": "completed",
             "call_id": call_id,
@@ -3238,6 +4098,15 @@ fn response_tool_call_item(
         item["namespace"] = json!(namespace);
     }
     item
+}
+
+fn tool_call_item_id(call_id: &str, name: &str, tool_context: &CodexToolContext) -> String {
+    let prefix = if tool_context.is_custom_tool_proxy(name) {
+        "ctc_"
+    } else {
+        "fc_"
+    };
+    format!("{prefix}{call_id}")
 }
 
 fn split_leading_think_block(text: &str) -> Option<(String, String)> {
@@ -3362,6 +4231,8 @@ fn extract_reasoning_summary_text(value: &Value) -> Option<String> {
 }
 
 fn default_responses_usage() -> Value {
+    // Codex 把 output_tokens_details.reasoning_tokens 当必填解析,
+    // 兜底 usage 也必须带齐该结构。
     json!({
         "input_tokens": 0,
         "output_tokens": 0,
@@ -3471,12 +4342,18 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
         result["input_tokens_details"] = json!({ "cached_tokens": cached_tokens });
     }
     if let Some(details) = usage.get("completion_tokens_details") {
+        // Codex parses output_tokens_details.reasoning_tokens as a required field;
+        // upstreams (e.g. Kimi) omit the key when a response had no reasoning,
+        // which makes the Responses client fail with "missing field
+        // `reasoning_tokens`" and abort the whole turn. Default it to 0.
         let mut details = details.clone();
         if details.is_object() && details.get("reasoning_tokens").is_none() {
             details["reasoning_tokens"] = json!(0);
         }
         result["output_tokens_details"] = details;
     } else {
+        // 上游连 completion_tokens_details 都没给时同样补全, 避免
+        // Codex 解析 response.completed 时缺字段断流。
         result["output_tokens_details"] = json!({ "reasoning_tokens": 0 });
     }
     if let Some(cache_read) = usage.get("cache_read_input_tokens") {
@@ -3528,6 +4405,114 @@ fn response_output_text(value: &Value) -> String {
         Value::Null => String::new(),
         other => canonical_json_string(other),
     }
+}
+
+const IMAGE_DATA_URL_PREFIX: &str = "data:image/";
+
+/// 若 `text` 含 base64 图片 data URL，返回替换成占位符后的文本；否则 `None`。
+fn redact_image_data_urls(text: &str) -> Option<String> {
+    if !text.contains(IMAGE_DATA_URL_PREFIX) {
+        return None;
+    }
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(IMAGE_DATA_URL_PREFIX) {
+        out.push_str(&rest[..start]);
+        out.push_str("[image omitted]");
+        let tail = &rest[start..];
+        // data URL 由 base64 字母表加少量分隔符组成，遇到其它字符即结束。
+        let end = tail
+            .find(|c: char| {
+                !(c.is_ascii_alphanumeric()
+                    || matches!(c, '+' | '/' | '=' | ':' | ';' | ',' | '.' | '-' | '_'))
+            })
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// base64 图片一旦落进文本字段就是灾难：上游会把它当普通文本 tokenize，而 base64
+/// 高熵、几乎没有可复用的 BPE merge（约 1.36 字符/token），一张 2MB 的图能膨胀到
+/// 约 200 万 token 并直接撑爆上下文窗口。图片的唯一合法归宿是 `image_url` 子树。
+///
+/// 这是最后一道兜底：出站前扫一遍 body，把漏进文本字段的 data URL 换成占位符。
+/// 命中即说明某条协议转换路径有 bug，记诊断日志便于定位。
+fn guard_inline_image_data_urls(value: &mut Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let mut hit = false;
+            for (key, child) in map.iter_mut() {
+                // image_url 子树是图片的合法归宿，跳过。
+                if key == "image_url" {
+                    continue;
+                }
+                hit |= guard_inline_image_data_urls(child);
+            }
+            hit
+        }
+        Value::Array(items) => {
+            let mut hit = false;
+            for item in items {
+                hit |= guard_inline_image_data_urls(item);
+            }
+            hit
+        }
+        Value::String(text) => match redact_image_data_urls(text) {
+            Some(cleaned) => {
+                *text = cleaned;
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// tool 输出可能带图 —— `view_image` 的结果就是
+/// `function_call_output.output[] = [{"type":"input_image","image_url":"data:image/png;base64,…"}]`。
+///
+/// 直接走 `response_output_text` 会把整个数组 JSON 序列化成字符串，于是 base64 被当作
+/// 普通文本送进上游 tokenizer。base64 是 BPE 最不擅长的输入（高熵、无可复用 merge，
+/// 约 1.36 字符/token），一张 2MB 的 PNG 因此膨胀到约 200 万 token 并撑爆上下文窗口；
+/// 同一张图走 `image_url` 只需几百 token，因为供应商在 tokenize 之前就把 base64 解码回
+/// 像素、按尺寸切 patch 计数。
+///
+/// 所以这里在**有图时**保留结构化的 `image_url` part，交给
+/// `relocate_tool_output_images` 在满足 tool 配对约束的前提下搬到后续 user 消息。
+/// 无图时原样返回 `response_output_text` 的结果，保持既有行为不变。
+fn tool_output_content(output: &Value) -> Value {
+    let Some(parts) = output.as_array() else {
+        return json!(response_output_text(output));
+    };
+    if !parts.iter().any(is_image_part) {
+        return json!(response_output_text(output));
+    }
+
+    let mut chat_parts = Vec::new();
+    for part in parts {
+        if is_image_part(part) {
+            if let Some(image) = image_part_to_chat(part) {
+                chat_parts.push(image);
+            }
+            continue;
+        }
+        let text = match part.get("type").and_then(Value::as_str) {
+            Some("input_text") | Some("output_text") | Some("text") => part
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            // 非文本非图片的块（结构化工具结果等）保留原有的 JSON 表示，
+            // 免得静默丢信息。
+            _ => canonical_json_string(part),
+        };
+        if !text.is_empty() {
+            chat_parts.push(json!({ "type": "text", "text": text }));
+        }
+    }
+    Value::Array(chat_parts)
 }
 
 fn build_custom_tool_call_history(name: &str, input: &Value) -> (String, String) {
@@ -3997,6 +4982,10 @@ fn apply_chat_reasoning_options(result: &mut Value, body: &Value, model: &str) {
         {
             result["reasoning_effort"] = json!(mapped);
         }
+        // Kimi For Coding (K3 / K2.7 Code): 官方接受 reasoning_effort 三档
+        // low/high/max (默认 high), 且服务端会把 medium→high、xhigh→max。
+        // 仅限 for-coding 模型 ID, 避免给 glm/mimo/kimi-k2 等其它
+        // Thinking 方言上游误发该字段。
         ChatReasoningStyle::Thinking if is_kimi_coding_model(model) => {
             result["reasoning_effort"] = json!(mapped);
         }
@@ -4071,6 +5060,8 @@ fn map_chat_reasoning_effort(effort: &str, style: ChatReasoningStyle) -> Option<
             "minimal" => Some("minimal"),
             _ => None,
         },
+        // Kimi For Coding 官方映射: minimal/low→low, medium/high→high,
+        // xhigh/max→max。注意不能直接透传 "minimal", 服务端不认会 400。
         ChatReasoningStyle::Thinking => match effort.as_str() {
             "minimal" | "low" => Some("low"),
             "medium" | "high" => Some("high"),
@@ -4089,6 +5080,9 @@ fn map_chat_reasoning_effort(effort: &str, style: ChatReasoningStyle) -> Option<
     }
 }
 
+/// Kimi For Coding 专属模型 ID(k3 / k3-256k / kimi-for-coding[-highspeed])。
+/// 只有这些上游接受 `reasoning_effort` 三档; kimi-k2-thinking 等旧模型
+/// 仍只发 thinking 开关。
 fn is_kimi_coding_model(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     model.starts_with("k3") || model.contains("for-coding")
