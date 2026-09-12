@@ -5,7 +5,13 @@
       "display_name": "Custom Model",
       "description": "Custom model",
       "base_instructions": "You are Codex, a coding agent. You and the user share one workspace. Follow the developer and user instructions provided in the conversation. Use the available tools to inspect, edit, and verify the workspace as needed. Be precise, safe, and helpful.",
-      "supported_reasoning_levels": [],
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        { "effort": "low", "description": "Fast responses with lighter reasoning" },
+        { "effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
+        { "effort": "high", "description": "Greater reasoning depth for complex problems" },
+        { "effort": "xhigh", "description": "Extra high reasoning depth for complex problems" }
+      ],
       "shell_type": "shell_command",
       "support_verbosity": false,
       "truncation_policy": {

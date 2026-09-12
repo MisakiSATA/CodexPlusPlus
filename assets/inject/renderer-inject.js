@@ -3087,6 +3087,9 @@
       if (seq === codexPlusBackendSettingsSeq) {
         codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
       }
+      // 清除 catalog 缓存，强制重新加载以获取更新后的模型元数据
+      codexModelCatalogLoadedAt = 0;
+      await loadCodexModelCatalog(true);
     } finally {
       refreshCodexPlusBackendToggles();
     }
@@ -6035,22 +6038,27 @@
   }
 
   function applyCodexPlusModelMetadata(descriptor, modelName) {
+    if (!descriptor) return false;
     const metadata = codexPlusModelMetadata(modelName);
-    if (!descriptor || !metadata) return false;
     let changed = false;
-    for (const key of ["displayName", "description", "defaultReasoningEffort"]) {
-      if (typeof metadata[key] === "string" && metadata[key] && descriptor[key] !== metadata[key]) {
-        descriptor[key] = metadata[key];
-        changed = true;
+
+    // Apply metadata fields when available
+    if (metadata) {
+      for (const key of ["displayName", "description", "defaultReasoningEffort"]) {
+        if (typeof metadata[key] === "string" && metadata[key] && descriptor[key] !== metadata[key]) {
+          descriptor[key] = metadata[key];
+          changed = true;
+        }
       }
     }
-    if (Array.isArray(metadata.supportedReasoningEfforts) && metadata.supportedReasoningEfforts.length > 0) {
-      const nextEfforts = modelReasoningEfforts(modelName);
-      if (JSON.stringify(descriptor.supportedReasoningEfforts || []) !== JSON.stringify(nextEfforts)) {
-        descriptor.supportedReasoningEfforts = nextEfforts;
-        changed = true;
-      }
+
+    // Always ensure reasoning efforts are present (uses fallback when metadata is null)
+    const nextEfforts = modelReasoningEfforts(modelName);
+    if (JSON.stringify(descriptor.supportedReasoningEfforts || []) !== JSON.stringify(nextEfforts)) {
+      descriptor.supportedReasoningEfforts = nextEfforts;
+      changed = true;
     }
+
     return changed;
   }
 

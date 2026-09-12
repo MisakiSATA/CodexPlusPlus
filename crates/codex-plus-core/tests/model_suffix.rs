@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use codex_plus_core::model_suffix::{
     build_model_catalog_json, collect_catalog_entries, model_ui_metadata, parse_model_suffix,
+    ModelCatalogEntry,
 };
+use serde_json::Value;
 
 #[test]
 fn parse_suffix_extracts_k_and_m_units() {
@@ -107,7 +109,15 @@ fn build_catalog_json_uses_runtime_compatible_generic_metadata() {
         serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
 
     for model in catalog["models"].as_array().unwrap() {
-        assert_eq!(model["supported_reasoning_levels"], serde_json::json!([]));
+        // 自定义模型现在有 4 档默认推理强度（low/medium/high/xhigh），不再是空数组
+        let efforts = model["supported_reasoning_levels"]
+            .as_array()
+            .expect("supported_reasoning_levels should be an array")
+            .iter()
+            .filter_map(|entry| entry["effort"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(efforts, vec!["low", "medium", "high", "xhigh"]);
+        assert_eq!(model["default_reasoning_level"], "medium");
         assert_eq!(model["shell_type"], "shell_command");
         assert_eq!(model["support_verbosity"], false);
         assert_eq!(
@@ -227,6 +237,83 @@ fn model_ui_metadata_exposes_deepseek_capabilities() {
         metadata["supportedReasoningEfforts"][0]["reasoningEffort"],
         "low"
     );
+}
+
+#[test]
+fn model_ui_metadata_provides_generic_fallback_for_unknown_models() {
+    // 未知的第三方模型（Claude、Grok 等）应该回落到 generic 推理能力
+    for slug in ["claude-opus-5", "grok-4.5", "qwen-max", "some-random-model"] {
+        let metadata = model_ui_metadata(slug)
+            .unwrap_or_else(|| panic!("{slug} should get generic fallback metadata"));
+
+        // 推理强度配置
+        assert_eq!(metadata["defaultReasoningEffort"], "medium");
+        let efforts = metadata["supportedReasoningEfforts"]
+            .as_array()
+            .expect("supportedReasoningEfforts should be an array")
+            .iter()
+            .filter_map(|entry| entry["reasoningEffort"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(efforts, vec!["low", "medium", "high", "xhigh"]);
+
+        // 泛型回落不应该带 displayName，避免把所有模型改名为 "Custom Model"
+        assert!(
+            metadata.get("displayName").is_none(),
+            "{slug} generic fallback should not override displayName"
+        );
+        assert!(
+            metadata.get("description").is_none(),
+            "{slug} generic fallback should not override description"
+        );
+
+        // 速度层级和服务层级空数组
+        assert_eq!(metadata["additionalSpeedTiers"], serde_json::json!([]));
+        assert_eq!(metadata["serviceTiers"], serde_json::json!([]));
+    }
+}
+
+#[test]
+fn build_model_catalog_includes_model_metadata() {
+    let entries = vec![
+        ModelCatalogEntry {
+            slug: "claude-opus-5".to_string(),
+            display_name: "claude-opus-5".to_string(),
+            suffix_window: None,
+        },
+        ModelCatalogEntry {
+            slug: "grok-2-1212".to_string(),
+            display_name: "grok-2-1212".to_string(),
+            suffix_window: None,
+        },
+    ];
+
+    let catalog_json = build_model_catalog_json(&entries, None);
+    let catalog: Value = serde_json::from_str(&catalog_json).unwrap();
+
+    // 调试：打印 catalog 的顶层键
+    eprintln!("Catalog keys: {:?}", catalog.as_object().unwrap().keys().collect::<Vec<_>>());
+    eprintln!("Has modelMetadata: {}", catalog.get("modelMetadata").is_some());
+
+    // 验证 modelMetadata 字段存在
+    assert!(catalog.get("modelMetadata").is_some(), "modelMetadata field should exist");
+
+    let metadata = catalog["modelMetadata"].as_object().unwrap();
+
+    // 验证所有模型都有 metadata
+    assert!(metadata.contains_key("claude-opus-5"), "claude-opus-5 should have metadata");
+    assert!(metadata.contains_key("grok-2-1212"), "grok-2-1212 should have metadata");
+
+    // 验证 claude-opus-5 的 metadata 包含推理强度
+    let claude_meta = &metadata["claude-opus-5"];
+    assert!(claude_meta.get("supportedReasoningEfforts").is_some(),
+        "claude-opus-5 should have supportedReasoningEfforts");
+    assert!(claude_meta.get("defaultReasoningEffort").is_some(),
+        "claude-opus-5 should have defaultReasoningEffort");
+
+    // 验证推理强度数据正确
+    let efforts = claude_meta["supportedReasoningEfforts"].as_array().unwrap();
+    assert_eq!(efforts.len(), 4, "Should have 4 reasoning levels");
+    assert_eq!(claude_meta["defaultReasoningEffort"], "medium");
 }
 
 #[test]

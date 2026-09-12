@@ -158,26 +158,16 @@ pub fn requires_bundled_metadata_catalog(slug: &str) -> bool {
     gpt56_metadata_entry(slug).is_some() || deepseek_metadata_entry(slug).is_some()
 }
 
+/// 暴露给渲染层（renderer-inject 的 `modelMetadata`）的模型能力。
+///
+/// 已知 slug（GPT-5.6 / DeepSeek）用各自的 bundled metadata；未知的自定义 slug
+/// 回落到 generic 模板，保证第三方模型（Claude、Grok 等）也能拿到推理强度档位。
 pub fn model_ui_metadata(slug: &str) -> Option<Value> {
-    let metadata = gpt56_metadata_entry(slug).or_else(|| deepseek_metadata_entry(slug))?;
-    let levels = metadata
-        .get("supported_reasoning_levels")?
-        .as_array()?
-        .iter()
-        .filter_map(|level| {
-            let effort = level.get("effort")?.as_str()?.trim();
-            if effort.is_empty() {
-                return None;
-            }
-            Some(json!({
-                "reasoningEffort": effort,
-                "description": level
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-            }))
-        })
-        .collect::<Vec<_>>();
+    let Some(metadata) = gpt56_metadata_entry(slug).or_else(|| deepseek_metadata_entry(slug))
+    else {
+        return generic_model_ui_metadata();
+    };
+    let levels = reasoning_levels_ui_metadata(&metadata)?;
     Some(json!({
         "displayName": metadata
             .get("display_name")
@@ -201,6 +191,49 @@ pub fn model_ui_metadata(slug: &str) -> Option<Value> {
             .cloned()
             .unwrap_or_else(|| json!([]))
     }))
+}
+
+/// 自定义 slug 的回落能力：只给推理强度相关字段。
+///
+/// 刻意不带 displayName / description：generic 模板里它们是字面量 "Custom Model"，
+/// 一并下发会把选择器里所有第三方模型的名字都改成 "Custom Model"。
+/// 渲染层对缺失的键会跳过，从而保留 slug 名与供应商描述。
+fn generic_model_ui_metadata() -> Option<Value> {
+    let template = generic_template_entry()?;
+    let levels = reasoning_levels_ui_metadata(&template)?;
+    Some(json!({
+        "defaultReasoningEffort": template
+            .get("default_reasoning_level")
+            .and_then(Value::as_str)
+            .unwrap_or("medium"),
+        "supportedReasoningEfforts": levels,
+        "additionalSpeedTiers": json!([]),
+        "serviceTiers": json!([])
+    }))
+}
+
+/// 把 catalog 条目的 `supported_reasoning_levels` 转成渲染层用的驼峰结构。
+fn reasoning_levels_ui_metadata(metadata: &Value) -> Option<Vec<Value>> {
+    Some(
+        metadata
+            .get("supported_reasoning_levels")?
+            .as_array()?
+            .iter()
+            .filter_map(|level| {
+                let effort = level.get("effort")?.as_str()?.trim();
+                if effort.is_empty() {
+                    return None;
+                }
+                Some(json!({
+                    "reasoningEffort": effort,
+                    "description": level
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                }))
+            })
+            .collect(),
+    )
 }
 
 /// 构建 codex model_catalog_json 内容。
@@ -271,7 +304,20 @@ pub fn build_model_catalog_json_with_template(
             model
         })
         .collect();
-    serde_json::to_string_pretty(&json!({ "models": models })).unwrap_or_default()
+
+    // 生成 modelMetadata 映射，供渲染层的 codexPlusModelMetadata 函数使用
+    let mut model_metadata = serde_json::Map::new();
+    for entry in entries {
+        if let Some(metadata) = model_ui_metadata(&entry.slug) {
+            model_metadata.insert(entry.slug.clone(), metadata);
+        }
+    }
+
+    serde_json::to_string_pretty(&json!({
+        "models": models,
+        "modelMetadata": model_metadata
+    }))
+    .unwrap_or_default()
 }
 
 fn model_template_entry(slug: &str) -> (Value, bool) {
@@ -318,6 +364,10 @@ fn bundled_template_entry(slug: &str) -> Option<Value> {
 fn first_bundled_template_entry() -> Option<Value> {
     // Use generic template for custom models instead of GPT-specific template
     // This avoids forcing GPT-specific fields (like base_instructions) on non-GPT models
+    generic_template_entry()
+}
+
+fn generic_template_entry() -> Option<Value> {
     let catalog: Value = serde_json::from_str(GENERIC_TEMPLATE_JSON).ok()?;
     catalog.get("models")?.as_array()?.first().cloned()
 }
