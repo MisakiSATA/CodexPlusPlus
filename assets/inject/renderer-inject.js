@@ -1,6 +1,73 @@
 (() => {
   const codexPlusIsWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent || "");
 
+  // Codex 26.908 的 rolldown 分包里 authed-route ↔ app-primary 互相 import，而应用启动时
+  // 用 Promise.all 并发 import(authed-route) 与 import(home-composer-route)。若后者的模块图先
+  // 完成加载，就会从 app-primary 一侧进入这个循环，authed-route 顶层的 n() 拿到尚未初始化的导出，
+  // 抛出 "TypeError: n is not a function"，模块永久报废，应用只剩「ChatGPT 遇到了问题」错误页。
+  // 我们在文档最早期抢先从 authed-route 一侧 import 一次，让循环按安全顺序求值；
+  // 找不到对应 chunk（其他版本）时什么都不做。
+  function installCodexModuleCycleGuard() {
+    if (window.__codexPlusModuleCycleGuard) return;
+    window.__codexPlusModuleCycleGuard = "pending";
+    const markGuard = (status, detail) => {
+      window.__codexPlusModuleCycleGuard = status;
+      // 这里可能在脚本顶部同步执行，而 sendCodexPlusDiagnostic 依赖脚本后面才初始化的 const，
+      // 所以统一推迟到下一轮事件循环再上报，且绝不让上报失败影响守护本身。
+      setTimeout(() => {
+        try {
+          sendCodexPlusDiagnostic("module_cycle_guard", { status, ...(detail || {}) });
+        } catch {
+        }
+      }, 0);
+    };
+    const findEntryScript = () => Array.from(document.scripts || [])
+      .map((script) => script.src)
+      .find((src) => /\/assets\/index-[^/]+\.js(\?|$)/.test(src || ""));
+    const fetchText = async (url) => {
+      const response = await fetch(url);
+      return response.ok ? await response.text() : "";
+    };
+    const findAsset = (text, prefix, base) => {
+      const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const match = text.match(new RegExp(`["'\`](\\./${escaped}[\\w-]+\\.js)["'\`]`));
+      return match ? new URL(match[1], base).href : "";
+    };
+    const start = (entry) => {
+      (async () => {
+        const initialUrl = findAsset(await fetchText(entry), "app-initial-", entry);
+        if (!initialUrl) return "no-app-initial";
+        const routeUrl = findAsset(await fetchText(initialUrl), "authed-route-", initialUrl);
+        if (!routeUrl) return "no-authed-route";
+        await import(routeUrl);
+        return "ready";
+      })().then((status) => markGuard(status)).catch((error) => {
+        markGuard("failed", { message: String(error?.message || error) });
+      });
+    };
+    const entry = findEntryScript();
+    if (entry) {
+      start(entry);
+      return;
+    }
+    // 通过 addScriptToEvaluateOnNewDocument 注入时，脚本先于 <script type=module> 标签执行，
+    // 此时 document.scripts 还是空的，等 DOM 解析完再找一次入口。
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", () => {
+        const lateEntry = findEntryScript();
+        if (lateEntry) start(lateEntry);
+        else markGuard("no-entry");
+      }, { once: true });
+      return;
+    }
+    markGuard("no-entry");
+  }
+  try {
+    installCodexModuleCycleGuard();
+  } catch {
+    window.__codexPlusModuleCycleGuard = "failed";
+  }
+
   function installCodexPlusFastStartup() {
     const config = window.__CODEX_PLUS_FAST_STARTUP__;
     if (!config || config.enabled !== true) return;

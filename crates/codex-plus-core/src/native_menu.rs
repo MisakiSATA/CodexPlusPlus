@@ -112,54 +112,98 @@ pub async fn install_native_menu_localizer(inspector_port: u16) -> anyhow::Resul
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("native menu localization failed")))
 }
 
-pub fn native_menu_localizer_script() -> anyhow::Result<String> {
-    let translations =
-        serde_json::to_string(&MENU_LABEL_TRANSLATIONS.iter().copied().collect::<Vec<_>>())?;
-    Ok(format!(
-        r#"
-(() => {{
-  const translations = new Map({translations});
+/// Codex 桌面版从这个版本起，菜单栏改为渲染层绘制并自带中文本地化。
+///
+/// 在这些版本上从外部改写 `Menu`（改 label 或重新 `setApplicationMenu`）会让渲染层抛出
+/// `TypeError: n is not a function`，触发「ChatGPT 出现了问题」错误页。脚本会按
+/// `app.getVersion()` 自动跳过 >= 该版本的应用。
+pub const NATIVE_MENU_I18N_SINCE: (u32, u32) = (26, 908);
+
+const NATIVE_MENU_LOCALIZER_TEMPLATE: &str = r#"
+(() => {
+  const translations = new Map(__TRANSLATIONS__);
+  const translatedLabels = new Set(translations.values());
   const electron = process.mainModule?.require?.("electron");
-  if (!electron?.Menu) return JSON.stringify({{ status: "skipped", reason: "electron-menu-unavailable" }});
+  if (!electron?.Menu) return JSON.stringify({ status: "skipped", reason: "electron-menu-unavailable" });
+  const appVersion = (() => {
+    try { return String(electron.app?.getVersion?.() ?? ""); } catch { return ""; }
+  })();
+  // Codex __I18N_MAJOR__.__I18N_MINOR__ 起菜单栏改为渲染层绘制并自带中文本地化；此时从外部改写 Menu
+  // （无论是改 label 还是重新 setApplicationMenu）都会让渲染层抛 "n is not a function"，
+  // 触发「ChatGPT 出现了问题」错误页。因此新版本一律不干预。
+  const NATIVE_MENU_I18N_SINCE = [__I18N_MAJOR__, __I18N_MINOR__];
+  const versionParts = appVersion.split(".").map((part) => Number.parseInt(part, 10));
+  const versionKnown = Number.isFinite(versionParts[0]) && Number.isFinite(versionParts[1]);
+  if (!versionKnown) {
+    return JSON.stringify({ status: "skipped", reason: "app-version-unknown", appVersion });
+  }
+  const [major, minor] = versionParts;
+  if (major > NATIVE_MENU_I18N_SINCE[0] || (major === NATIVE_MENU_I18N_SINCE[0] && minor >= NATIVE_MENU_I18N_SINCE[1])) {
+    return JSON.stringify({ status: "skipped", reason: "native-menu-i18n", appVersion });
+  }
   const Menu = electron.Menu;
   let changed = 0;
-  const translateItem = (item) => {{
+  const topLabels = (menu) => (Array.isArray(menu?.items) ? menu.items.map((item) => item?.label) : []);
+  // 顶层任一 label 已是译文，说明应用自己完成了本地化，不再需要（也不应该）我们介入。
+  const alreadyLocalized = (menu) => topLabels(menu).some((label) => translatedLabels.has(label));
+  const translateItem = (item) => {
     if (!item) return;
     const nextLabel = translations.get(item.label);
-    if (nextLabel && item.label !== nextLabel) {{
+    if (nextLabel && item.label !== nextLabel) {
       item.label = nextLabel;
       changed += 1;
-    }}
-    if (item.submenu?.items) {{
+    }
+    if (item.submenu?.items) {
       for (const child of item.submenu.items) translateItem(child);
-    }}
-  }};
-  const translateMenu = (menu) => {{
+    }
+  };
+  const translateMenu = (menu) => {
     if (!menu?.items) return menu;
     for (const item of menu.items) translateItem(item);
     return menu;
-  }};
-  if (!globalThis.__codexPlusNativeMenuLocalizerInstalled) {{
+  };
+  if (!globalThis.__codexPlusNativeMenuLocalizerInstalled) {
     globalThis.__codexPlusNativeMenuLocalizerInstalled = true;
     const originalSetApplicationMenu = Menu.setApplicationMenu.bind(Menu);
-    Menu.setApplicationMenu = (menu) => {{
-      try {{ translateMenu(menu); }} catch {{}}
+    Menu.setApplicationMenu = (menu) => {
+      if (alreadyLocalized(menu)) globalThis.__codexPlusNativeMenuLocalizerNativeI18n = true;
+      if (!globalThis.__codexPlusNativeMenuLocalizerNativeI18n) {
+        try { translateMenu(menu); } catch {}
+      }
       return originalSetApplicationMenu(menu);
-    }};
-  }}
+    };
+  }
   const menu = Menu.getApplicationMenu();
-  if (menu) {{
+  if (menu && alreadyLocalized(menu)) {
+    globalThis.__codexPlusNativeMenuLocalizerNativeI18n = true;
+    return JSON.stringify({ status: "skipped", reason: "menu-already-localized", appVersion, topLabels: topLabels(menu) });
+  }
+  if (menu) {
     translateMenu(menu);
-    Menu.setApplicationMenu(menu);
-  }}
-  return JSON.stringify({{
-    status: "ok",
-    changed,
-    topLabels: menu?.items?.map((item) => item.label) ?? []
-  }});
-}})()
-"#
-    ))
+    // 只有真的改了 label 才重新 set；原样重新 set 同一个菜单没有意义，还会在新版本上触发渲染层崩溃。
+    if (changed > 0) Menu.setApplicationMenu(menu);
+  }
+  return JSON.stringify({ status: "ok", changed, appVersion, topLabels: topLabels(menu) });
+})()
+"#;
+
+pub fn native_menu_localizer_script() -> anyhow::Result<String> {
+    let translations =
+        serde_json::to_string(&MENU_LABEL_TRANSLATIONS.iter().copied().collect::<Vec<_>>())?;
+    Ok(NATIVE_MENU_LOCALIZER_TEMPLATE
+        .replace("__TRANSLATIONS__", &translations)
+        .replace("__I18N_MAJOR__", &NATIVE_MENU_I18N_SINCE.0.to_string())
+        .replace("__I18N_MINOR__", &NATIVE_MENU_I18N_SINCE.1.to_string()))
+}
+
+/// 从 `Runtime.evaluate` 的返回值里解出脚本自己序列化的 JSON 结果。
+fn localizer_script_outcome(result: &serde_json::Value) -> Option<serde_json::Value> {
+    let value = result
+        .get("result")
+        .and_then(|value| value.get("result"))
+        .and_then(|value| value.get("value"))
+        .and_then(serde_json::Value::as_str)?;
+    serde_json::from_str(value).ok()
 }
 
 async fn try_install_native_menu_localizer(inspector_port: u16) -> anyhow::Result<()> {
@@ -196,12 +240,24 @@ async fn try_install_native_menu_localizer(inspector_port: u16) -> anyhow::Resul
     {
         bail!("native menu localizer threw: {exception}");
     }
+    let outcome = localizer_script_outcome(&result);
+    let skipped = outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("skipped");
+    let event = if skipped {
+        "native_menu.localization_skipped"
+    } else {
+        "native_menu.localization_installed"
+    };
     let _ = crate::diagnostic_log::append_diagnostic_log(
-        "native_menu.localization_installed",
+        event,
         json!({
             "inspector_port": inspector_port,
             "target_type": target.target_type,
             "target_title": target.title,
+            "outcome": outcome,
             "result": result
         }),
     );
@@ -220,5 +276,46 @@ mod tests {
         assert!(script.contains("Toggle Sidebar"));
         assert!(script.contains("切换边栏"));
         assert!(!script.contains("app.asar"));
+        assert!(!script.contains("__TRANSLATIONS__"));
+    }
+
+    #[test]
+    fn native_menu_localizer_script_skips_codex_versions_with_native_menu_i18n() {
+        let script = native_menu_localizer_script().unwrap();
+
+        assert!(script.contains("electron.app?.getVersion?.()"));
+        assert!(script.contains("const NATIVE_MENU_I18N_SINCE = [26, 908];"));
+        assert!(script.contains(r#"reason: "native-menu-i18n""#));
+        assert!(script.contains(r#"reason: "app-version-unknown""#));
+        assert!(!script.contains("__I18N_MAJOR__"));
+        assert!(!script.contains("__I18N_MINOR__"));
+    }
+
+    #[test]
+    fn native_menu_localizer_script_never_resets_an_unchanged_menu() {
+        let script = native_menu_localizer_script().unwrap();
+
+        assert!(script.contains("if (changed > 0) Menu.setApplicationMenu(menu);"));
+        assert!(script.contains(r#"reason: "menu-already-localized""#));
+        assert!(script.contains("__codexPlusNativeMenuLocalizerNativeI18n"));
+    }
+
+    #[test]
+    fn localizer_script_outcome_reads_serialized_status() {
+        let result = json!({
+            "id": 1,
+            "result": {
+                "result": {
+                    "type": "string",
+                    "value": r#"{"status":"skipped","reason":"native-menu-i18n","appVersion":"26.908.31748"}"#
+                }
+            }
+        });
+
+        let outcome = localizer_script_outcome(&result).unwrap();
+
+        assert_eq!(outcome["status"], "skipped");
+        assert_eq!(outcome["reason"], "native-menu-i18n");
+        assert!(localizer_script_outcome(&json!({"id": 1})).is_none());
     }
 }

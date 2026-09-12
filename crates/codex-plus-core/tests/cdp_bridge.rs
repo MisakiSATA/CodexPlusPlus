@@ -2,8 +2,9 @@ use base64::Engine;
 use codex_plus_core::assets;
 use codex_plus_core::bridge::{self, BRIDGE_BINDING_NAME};
 use codex_plus_core::cdp::{
-    CdpTarget, is_avatar_overlay_page_target, is_primary_codex_page_target, list_targets,
-    pick_injectable_codex_page_target, pick_page_target, validate_cdp_websocket_url,
+    CdpTarget, is_avatar_overlay_page_target, is_primary_codex_page_target,
+    is_quick_chat_page_target, list_targets, pick_injectable_codex_page_target, pick_page_target,
+    validate_cdp_websocket_url,
 };
 
 use futures_util::{SinkExt, StreamExt};
@@ -2014,6 +2015,110 @@ fn pick_injectable_codex_page_target_requires_websocket() {
             .to_string()
             .contains("No injectable Codex page target found")
     );
+}
+
+#[test]
+fn pick_injectable_codex_page_target_accepts_codex_app_main_window_titled_chatgpt() {
+    // Codex 26.825+ 主窗口的 title 是 "ChatGPT"，URL 是 app://-/index.html，标题里没有 "codex"
+    let targets = vec![
+        target(
+            "overlay",
+            "page",
+            "",
+            "app://-/index.html?initialRoute=%2Favatar-overlay",
+            Some("ws://overlay"),
+        ),
+        target(
+            "main",
+            "page",
+            "ChatGPT",
+            "app://-/index.html",
+            Some("ws://main"),
+        ),
+    ];
+
+    let picked = pick_injectable_codex_page_target(&targets)
+        .expect("Codex app main window should be selected even without 'codex' in its title");
+
+    assert_eq!(picked.id, "main");
+    assert!(is_primary_codex_page_target(&targets[1]));
+}
+
+#[test]
+fn pick_injectable_codex_page_target_accepts_codex_app_main_window_with_empty_title() {
+    // 页面刚开始加载时 title 还是空串
+    let targets = vec![target(
+        "main",
+        "page",
+        "",
+        "app://-/index.html",
+        Some("ws://main"),
+    )];
+
+    let picked = pick_injectable_codex_page_target(&targets)
+        .expect("Codex app main window with empty title should be selected");
+
+    assert_eq!(picked.id, "main");
+}
+
+#[test]
+fn pick_injectable_codex_page_target_skips_quick_chat_windows() {
+    let prewarm = target(
+        "quick-chat-prewarm",
+        "page",
+        "ChatGPT",
+        "app://-/index.html?initialRoute=%2Fchatgpt%2Fquick-chat-prewarm",
+        Some("ws://prewarm"),
+    );
+    let quick_chat = target(
+        "quick-chat",
+        "page",
+        "ChatGPT",
+        "app://-/index.html?initialRoute=/chatgpt/quick-chat/thread-1",
+        Some("ws://quick-chat"),
+    );
+    let main = target(
+        "main",
+        "page",
+        "ChatGPT",
+        "app://-/index.html",
+        Some("ws://main"),
+    );
+
+    assert!(is_quick_chat_page_target(&prewarm));
+    assert!(is_quick_chat_page_target(&quick_chat));
+    assert!(!is_quick_chat_page_target(&main));
+    assert!(!is_primary_codex_page_target(&prewarm));
+
+    let only_quick_chat = vec![prewarm.clone(), quick_chat.clone()];
+    pick_injectable_codex_page_target(&only_quick_chat)
+        .expect_err("quick chat windows must not be selected for injection");
+
+    let picked = pick_injectable_codex_page_target(&[prewarm, quick_chat, main]).unwrap();
+    assert_eq!(picked.id, "main");
+}
+
+#[test]
+fn codex_app_page_detection_ignores_lookalike_urls() {
+    let external = target(
+        "external",
+        "page",
+        "ChatGPT",
+        "https://example.test/app://-/index.html",
+        Some("ws://external"),
+    );
+    let other_scheme = target(
+        "file",
+        "page",
+        "ChatGPT",
+        "file:///index.html",
+        Some("ws://file"),
+    );
+
+    assert!(!is_primary_codex_page_target(&external));
+    assert!(!is_primary_codex_page_target(&other_scheme));
+    pick_injectable_codex_page_target(&[external, other_scheme])
+        .expect_err("lookalike URLs must not be treated as the Codex app");
 }
 
 #[tokio::test]

@@ -176,16 +176,33 @@ pub fn pick_page_target(targets: &[CdpTarget]) -> anyhow::Result<CdpTarget> {
 }
 
 pub fn pick_injectable_codex_page_target(targets: &[CdpTarget]) -> anyhow::Result<CdpTarget> {
-    for target in targets
-        .iter()
-        .filter(|target| is_injectable_page_target(target))
-    {
-        if is_primary_codex_page_target(target) {
+    // Codex 26.825+ 的主窗口 title 可能是 "ChatGPT" 甚至空串，只能靠 app://-/index.html 认；
+    // 按「最像主窗口」的优先级依次挑选，避免误选头像悬浮窗 / 快捷聊天窗。
+    let priorities: [fn(&CdpTarget) -> bool; 4] = [
+        is_exact_codex_app_main_target,
+        is_primary_codex_app_target,
+        is_chatgpt_desktop_page_target,
+        is_supported_codex_page_target,
+    ];
+    for matches_priority in priorities {
+        if let Some(target) = targets
+            .iter()
+            .find(|target| is_injectable_page_target(target) && matches_priority(target))
+        {
             return Ok(target.clone());
         }
     }
-
     bail!("No injectable Codex page target found")
+}
+
+/// Codex 桌面版自身的页面：`app://-/index.html`（可带 query，如 initialRoute）。
+fn is_codex_app_page_target(target: &CdpTarget) -> bool {
+    let Ok(url) = reqwest::Url::parse(target.url.trim()) else {
+        return false;
+    };
+    url.scheme().eq_ignore_ascii_case("app")
+        && url.host_str() == Some("-")
+        && url.path().eq_ignore_ascii_case("/index.html")
 }
 
 pub fn is_injectable_page_target(target: &CdpTarget) -> bool {
@@ -201,21 +218,55 @@ pub fn is_codex_page_target(target: &CdpTarget) -> bool {
         return false;
     }
     let haystack = format!("{} {}", target.title, target.url).to_lowercase();
-    haystack.contains("codex") || is_chatgpt_desktop_page(&target.title, &target.url)
+    haystack.contains("codex")
+        || is_codex_app_page_target(target)
+        || is_chatgpt_desktop_page(&target.title, &target.url)
 }
 
 pub fn is_primary_codex_page_target(target: &CdpTarget) -> bool {
-    is_codex_page_target(target) && !is_avatar_overlay_page_target(target)
+    is_codex_page_target(target)
+        && !is_avatar_overlay_page_target(target)
+        && !is_quick_chat_page_target(target)
+}
+
+fn is_exact_codex_app_main_target(target: &CdpTarget) -> bool {
+    target.url.trim().eq_ignore_ascii_case("app://-/index.html")
+}
+
+fn is_primary_codex_app_target(target: &CdpTarget) -> bool {
+    is_codex_app_page_target(target) && is_primary_codex_page_target(target)
+}
+
+fn is_chatgpt_desktop_page_target(target: &CdpTarget) -> bool {
+    is_primary_codex_page_target(target) && is_chatgpt_desktop_page(&target.title, &target.url)
+}
+
+fn is_supported_codex_page_target(target: &CdpTarget) -> bool {
+    is_primary_codex_page_target(target)
+        && (is_codex_app_page_target(target) || is_chatgpt_desktop_page(&target.title, &target.url))
 }
 
 pub fn is_avatar_overlay_page_target(target: &CdpTarget) -> bool {
-    if !is_injectable_page_target(target) {
-        return false;
+    initial_route(target).is_some_and(|route| route.eq_ignore_ascii_case("/avatar-overlay"))
+}
+
+pub fn is_quick_chat_page_target(target: &CdpTarget) -> bool {
+    initial_route(target).is_some_and(|route| {
+        let route = route.to_ascii_lowercase();
+        route == "/chatgpt/quick-chat"
+            || route == "/chatgpt/quick-chat-prewarm"
+            || route.starts_with("/chatgpt/quick-chat/")
+    })
+}
+
+fn initial_route(target: &CdpTarget) -> Option<String> {
+    if !is_injectable_page_target(target) || !is_codex_app_page_target(target) {
+        return None;
     }
-    let url = target.url.trim().to_ascii_lowercase();
-    url.starts_with("app://-/index.html?")
-        && (url.contains("initialroute=%2favatar-overlay")
-            || url.contains("initialroute=/avatar-overlay"))
+    let url = reqwest::Url::parse(target.url.trim()).ok()?;
+    url.query_pairs()
+        .find(|(key, _)| key.eq_ignore_ascii_case("initialRoute"))
+        .map(|(_, value)| value.into_owned())
 }
 
 fn is_chatgpt_desktop_page(title: &str, url: &str) -> bool {
